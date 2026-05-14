@@ -39,7 +39,8 @@ async def handle_incoming(event):
 
         # Modalità test: risponde solo al numero di test
         if TEST_MODE:
-            if TEST_SENDER_ID and str(sender_id) != TEST_SENDER_ID:
+            allowed_ids = [x.strip() for x in TEST_SENDER_ID.split(",")]
+if TEST_SENDER_ID and str(sender_id) not in allowed_ids:
                 print(f"[TEST MODE] Ignoro {full_name} — non è il tester")
                 return
             print(f"[TEST MODE] Messaggio da tester: {full_name}")
