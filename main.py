@@ -10,6 +10,8 @@ API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-5137754911"))
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -18,26 +20,41 @@ async def handle_incoming(event):
     try:
         if not event.is_private:
             return
+
         sender = await event.get_sender()
         if not isinstance(sender, User):
             return
         if sender.bot:
             return
+
         me = await client.get_me()
         if sender.id == me.id:
             return
+
         first_name = sender.first_name or ""
         last_name = sender.last_name or ""
         full_name = f"{first_name} {last_name}".strip()
         sender_username = sender.username or ""
         sender_id = sender.id
+
+        # Modalità test: risponde solo al numero di test
+        if TEST_MODE:
+            if TEST_SENDER_ID and str(sender_id) != TEST_SENDER_ID:
+                print(f"[TEST MODE] Ignoro {full_name} — non è il tester")
+                return
+            print(f"[TEST MODE] Messaggio da tester: {full_name}")
+
+        # Ignora VIP
         if "VIP" in full_name.upper():
             print(f"[SKIP VIP] {full_name}")
             return
+
         message_text = event.message.message or ""
         if not message_text.strip():
             return
-        print(f"[MSG IN] {full_name}: {message_text[:80]}")
+
+        print(f"[MSG IN] {full_name} (@{sender_username}): {message_text[:80]}")
+
         payload = {
             "sender_id": str(sender_id),
             "sender_username": sender_username,
@@ -46,6 +63,7 @@ async def handle_incoming(event):
             "chat_id": str(sender_id),
             "message_text": message_text
         }
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 N8N_WEBHOOK_URL,
@@ -60,6 +78,7 @@ async def handle_incoming(event):
                         print(f"[MSG OUT] → {full_name}: {reply_text[:80]}")
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
+
     except Exception as e:
         print(f"[EXCEPTION] {e}")
 
@@ -68,17 +87,38 @@ async def handle_control(event):
     text = event.message.message or ""
     if text.startswith("/stato"):
         me = await client.get_me()
-        await event.reply(f"🤖 Jack Agent attivo\n📱 @{me.username}\n✅ Tutto operativo")
+        await event.reply(
+            f"🤖 Jack Agent attivo\n"
+            f"📱 @{me.username}\n"
+            f"🔧 Test mode: {TEST_MODE}\n"
+            f"✅ Tutto operativo"
+        )
 
 async def main():
     print("🚀 Jack Supporto Agent avviato")
     await client.connect()
+
+    authorized = await client.is_user_authorized()
+    if not authorized:
+        print("[ERROR] Sessione non autorizzata — rigenera la session string")
+        return
+
     me = await client.get_me()
-    print(f"✅ Connesso come @{me.username} ({me.first_name})")
+    print(f"✅ Connesso come {me.first_name} (@{me.username})")
+    print(f"🔧 Test mode: {TEST_MODE}")
+    print(f"📡 Webhook: {N8N_WEBHOOK_URL[:50]}...")
+
     try:
-        await client.send_message(CONTROL_CHAT_ID, f"🟢 Jack Agent online\n📱 @{me.username}\nPronto.")
+        await client.send_message(
+            CONTROL_CHAT_ID,
+            f"🟢 Jack Agent online\n"
+            f"📱 @{me.username}\n"
+            f"🔧 Test mode: {TEST_MODE}\n"
+            f"Pronto a ricevere messaggi."
+        )
     except Exception as e:
-        print(f"[WARN] {e}")
+        print(f"[WARN] Notifica controllo: {e}")
+
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
