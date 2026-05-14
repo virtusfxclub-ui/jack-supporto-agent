@@ -61,14 +61,16 @@ async def handle_incoming(event):
                 timeout=aiohttp.ClientTimeout(total=180)
             ) as resp:
                 if resp.status == 200:
-    try:
-        response_data = await resp.json()
-        reply_text = response_data.get("reply", "") if response_data else ""
-    except:
-        reply_text = ""
+                    try:
+                        response_data = await resp.json()
+                        reply_text = response_data.get("reply", "") if response_data else ""
+                    except Exception:
+                        reply_text = ""
                     if reply_text:
                         await client.send_message(sender_id, reply_text)
                         print(f"[MSG OUT] → {full_name}: {reply_text[:80]}")
+                    else:
+                        print(f"[WARN] Nessuna reply ricevuta da n8n")
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
     except Exception as e:
@@ -93,7 +95,10 @@ async def main():
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"📡 Webhook: {N8N_WEBHOOK_URL[:50]}...")
     try:
-        await client.send_message(CONTROL_CHAT_ID, f"🟢 Jack Agent online\n📱 @{me.username}\n🔧 Test mode: {TEST_MODE}\nPronto.")
+        await client.send_message(
+            CONTROL_CHAT_ID,
+            f"🟢 Jack Agent online\n📱 @{me.username}\n🔧 Test mode: {TEST_MODE}\nPronto."
+        )
     except Exception as e:
         print(f"[WARN] {e}")
     await client.run_until_disconnected()
