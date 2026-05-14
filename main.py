@@ -62,8 +62,8 @@ async def handle_incoming(event):
             ) as resp:
                 if resp.status == 200:
                     try:
-                        response_data = await resp.json()
-                        reply_text = response_data.get("reply", "") if response_data else ""
+                        reply_text = await resp.text()
+                        reply_text = reply_text.strip()
                     except Exception:
                         reply_text = ""
                     if reply_text:
