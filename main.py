@@ -3,7 +3,8 @@ import aiohttp
 import os
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import User
+from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.functions.messages import GetHistoryRequest
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
@@ -14,6 +15,16 @@ TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+async def send_split_messages(chat_id, text):
+    """Spezza il testo in messaggi separati su doppio newline"""
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not parts:
+        return
+    for i, part in enumerate(parts):
+        await client.send_message(chat_id, part)
+        if i < len(parts) - 1:
+            await asyncio.sleep(1.5)
 
 @client.on(events.NewMessage(incoming=True))
 async def handle_incoming(event):
@@ -28,32 +39,60 @@ async def handle_incoming(event):
         me = await client.get_me()
         if sender.id == me.id:
             return
+
         first_name = sender.first_name or ""
         last_name = sender.last_name or ""
         full_name = f"{first_name} {last_name}".strip()
         sender_username = sender.username or ""
         sender_id = sender.id
+
         if TEST_MODE:
             allowed_ids = [x.strip() for x in TEST_SENDER_ID.split(",")]
             if str(sender_id) not in allowed_ids:
                 print(f"[TEST MODE] Ignoro {full_name} — non è il tester")
                 return
             print(f"[TEST MODE] Messaggio da tester: {full_name}")
+
         if "VIP" in full_name.upper():
             print(f"[SKIP VIP] {full_name}")
             return
+
+        # Gestisci testo, audio e immagini
         message_text = event.message.message or ""
+        media_type = None
+
+        if event.message.media:
+            if isinstance(event.message.media, MessageMediaPhoto):
+                media_type = "immagine"
+                if not message_text:
+                    message_text = "[L'utente ha inviato un'immagine]"
+                else:
+                    message_text = f"[Immagine con didascalia]: {message_text}"
+            elif isinstance(event.message.media, MessageMediaDocument):
+                doc = event.message.media.document
+                mime = doc.mime_type if hasattr(doc, 'mime_type') else ""
+                if "audio" in mime or "ogg" in mime:
+                    media_type = "audio"
+                    message_text = "[L'utente ha inviato un messaggio vocale — non posso ascoltarlo, chiedi di scrivere]"
+                else:
+                    media_type = "documento"
+                    message_text = f"[L'utente ha inviato un file: {mime}]"
+
         if not message_text.strip():
             return
+
         print(f"[MSG IN] {full_name} (@{sender_username}): {message_text[:80]}")
+
         payload = {
             "sender_id": str(sender_id),
             "sender_username": sender_username,
             "sender_full_name": full_name,
             "sender_name": first_name,
             "chat_id": str(sender_id),
-            "message_text": message_text
+            "message_text": message_text,
+            "media_type": media_type or "text"
         }
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 N8N_WEBHOOK_URL,
@@ -67,12 +106,13 @@ async def handle_incoming(event):
                     except Exception:
                         reply_text = ""
                     if reply_text:
-                        await client.send_message(sender_id, reply_text)
+                        await send_split_messages(sender_id, reply_text)
                         print(f"[MSG OUT] → {full_name}: {reply_text[:80]}")
                     else:
                         print(f"[WARN] Nessuna reply ricevuta da n8n")
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
+
     except Exception as e:
         print(f"[EXCEPTION] {e}")
 
