@@ -61,8 +61,11 @@ async def handle_incoming(event):
                 timeout=aiohttp.ClientTimeout(total=180)
             ) as resp:
                 if resp.status == 200:
-                    response_data = await resp.json()
-                    reply_text = response_data.get("reply", "")
+    try:
+        response_data = await resp.json()
+        reply_text = response_data.get("reply", "") if response_data else ""
+    except:
+        reply_text = ""
                     if reply_text:
                         await client.send_message(sender_id, reply_text)
                         print(f"[MSG OUT] → {full_name}: {reply_text[:80]}")
