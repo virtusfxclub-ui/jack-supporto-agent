@@ -7,15 +7,11 @@ from telethon.tl.types import User
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
-PHONE = os.environ.get("TELEGRAM_PHONE", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-5137754911"))
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    client = TelegramClient("jack_supporto", API_ID, API_HASH)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 @client.on(events.NewMessage(incoming=True))
 async def handle_incoming(event):
@@ -76,7 +72,7 @@ async def handle_control(event):
 
 async def main():
     print("🚀 Jack Supporto Agent avviato")
-    await client.start()
+    await client.connect()
     me = await client.get_me()
     print(f"✅ Connesso come @{me.username} ({me.first_name})")
     try:
