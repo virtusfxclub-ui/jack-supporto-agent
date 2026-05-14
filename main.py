@@ -76,7 +76,7 @@ async def handle_control(event):
 
 async def main():
     print("🚀 Jack Supporto Agent avviato")
-    await client.start(phone=PHONE if not SESSION_STRING else None)
+    await client.start()
     me = await client.get_me()
     print(f"✅ Connesso come @{me.username} ({me.first_name})")
     try:
