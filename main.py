@@ -1,6 +1,8 @@
 import asyncio
 import aiohttp
 import os
+import base64
+import tempfile
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
@@ -12,6 +14,7 @@ CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-5137754911"))
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 DEBOUNCE_TEXT = 30
 DEBOUNCE_IMAGE = 20
@@ -21,6 +24,40 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 pending_messages = {}
 pending_tasks = {}
+
+async def transcribe_audio(file_path: str) -> str:
+    """Trascrive un file audio usando Whisper API di OpenAI"""
+    try:
+        with open(file_path, "rb") as audio_file:
+            async with aiohttp.ClientSession() as session:
+                data = aiohttp.FormData()
+                data.add_field("file", audio_file, filename="audio.ogg", content_type="audio/ogg")
+                data.add_field("model", "whisper-1")
+                data.add_field("language", "it")
+                async with session.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    data=data,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        return result.get("text", "")
+                    else:
+                        print(f"[WHISPER ERROR] Status: {resp.status}")
+                        return ""
+    except Exception as e:
+        print(f"[WHISPER EXCEPTION] {e}")
+        return ""
+
+async def encode_image_base64(file_path: str) -> str:
+    """Converte un'immagine in base64"""
+    try:
+        with open(file_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode("utf-8")
+    except Exception as e:
+        print(f"[IMAGE ENCODE ERROR] {e}")
+        return ""
 
 async def send_split_messages(chat_id, text):
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -37,8 +74,12 @@ async def process_messages(sender_id, sender_info, debounce):
         return
     messages = pending_messages.pop(sender_id, [])
     pending_tasks.pop(sender_id, None)
-    combined_text = "\n".join(messages)
+    combined_text = "\n".join([m["text"] for m in messages if m.get("text")])
+    image_base64 = next((m.get("image_b64") for m in messages if m.get("image_b64")), None)
+    media_type = messages[-1].get("media_type", "text")
+
     print(f"[MSG IN] {sender_info['full_name']}: {combined_text[:100]}")
+
     payload = {
         "sender_id": str(sender_id),
         "sender_username": sender_info["username"],
@@ -46,8 +87,10 @@ async def process_messages(sender_id, sender_info, debounce):
         "sender_name": sender_info["first_name"],
         "chat_id": str(sender_id),
         "message_text": combined_text,
-        "media_type": sender_info.get("media_type", "text")
+        "media_type": media_type,
+        "image_base64": image_base64 or ""
     }
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -105,31 +148,64 @@ async def handle_incoming(event):
         message_text = event.message.message or ""
         media_type = "text"
         debounce = DEBOUNCE_TEXT
+        image_b64 = None
 
         if event.message.media:
             if isinstance(event.message.media, MessageMediaPhoto):
                 media_type = "immagine"
                 debounce = DEBOUNCE_IMAGE
-                message_text = f"[Immagine{': ' + message_text if message_text else ''}]"
+                print(f"[IMAGE] Scarico immagine da {full_name}...")
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    await client.download_media(event.message, file=tmp_path)
+                    image_b64 = await encode_image_base64(tmp_path)
+                    os.unlink(tmp_path)
+                    if message_text:
+                        message_text = f"[L'utente ha inviato un'immagine con didascalia: {message_text}]"
+                    else:
+                        message_text = "[L'utente ha inviato un'immagine — descrivila e rispondi in base al contesto della conversazione]"
+                    print(f"[IMAGE] Immagine codificata, dimensione b64: {len(image_b64)} chars")
+                except Exception as e:
+                    print(f"[IMAGE ERROR] {e}")
+                    message_text = "[L'utente ha inviato un'immagine]"
 
             elif isinstance(event.message.media, MessageMediaDocument):
                 doc = event.message.media.document
-                mime = doc.mime_type if hasattr(doc, 'mime_type') else ""
+                mime = doc.mime_type if hasattr(doc, "mime_type") else ""
 
-                if "audio" in mime or "ogg" in mime:
+                if "audio" in mime or "ogg" in mime or "voice" in mime:
                     media_type = "audio"
-                    # Leggi durata audio dal metadata
                     audio_duration = 0
                     try:
                         for attr in doc.attributes:
-                            if hasattr(attr, 'duration'):
+                            if hasattr(attr, "duration"):
                                 audio_duration = int(attr.duration)
                                 break
                     except Exception:
                         audio_duration = 30
+
                     debounce = audio_duration + DEBOUNCE_EXTRA_AUDIO
-                    message_text = f"[L'utente ha inviato un messaggio vocale di {audio_duration} secondi — rispondi chiedendo di scrivere in testo perché non puoi ascoltare gli audio]"
-                    print(f"[AUDIO] Durata: {audio_duration}s — debounce: {debounce}s")
+                    print(f"[AUDIO] Durata: {audio_duration}s — scarico e trascrivo...")
+
+                    if OPENAI_API_KEY:
+                        try:
+                            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                                tmp_path = tmp.name
+                            await client.download_media(event.message, file=tmp_path)
+                            transcription = await transcribe_audio(tmp_path)
+                            os.unlink(tmp_path)
+                            if transcription:
+                                message_text = f"[MESSAGGIO VOCALE TRASCRITTO]: {transcription}"
+                                print(f"[AUDIO] Trascrizione: {transcription[:100]}")
+                            else:
+                                message_text = "[L'utente ha inviato un messaggio vocale ma la trascrizione è fallita — chiedi di ripetere per iscritto]"
+                        except Exception as e:
+                            print(f"[AUDIO ERROR] {e}")
+                            message_text = "[L'utente ha inviato un messaggio vocale — chiedi di ripetere per iscritto]"
+                    else:
+                        message_text = "[L'utente ha inviato un messaggio vocale — chiedi di ripetere per iscritto]"
+
                 else:
                     media_type = "documento"
                     message_text = "[L'utente ha inviato un file]"
@@ -140,7 +216,12 @@ async def handle_incoming(event):
 
         if sender_id not in pending_messages:
             pending_messages[sender_id] = []
-        pending_messages[sender_id].append(message_text)
+
+        pending_messages[sender_id].append({
+            "text": message_text,
+            "media_type": media_type,
+            "image_b64": image_b64
+        })
 
         sender_info = {
             "full_name": full_name,
@@ -149,7 +230,6 @@ async def handle_incoming(event):
             "media_type": media_type
         }
 
-        # Cancella task precedente e crea nuovo con debounce aggiornato
         if sender_id in pending_tasks and not pending_tasks[sender_id].done():
             pending_tasks[sender_id].cancel()
 
@@ -179,11 +259,12 @@ async def main():
     me = await client.get_me()
     print(f"✅ Connesso come {me.first_name} (@{me.username})")
     print(f"🔧 Test mode: {TEST_MODE}")
+    print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
     print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio: durata+{DEBOUNCE_EXTRA_AUDIO}s | immagine: {DEBOUNCE_IMAGE}s")
     try:
         await client.send_message(
             CONTROL_CHAT_ID,
-            f"🟢 Jack Agent online\n📱 @{me.username}\n🔧 Test mode: {TEST_MODE}\nPronto."
+            f"🟢 Jack Agent online\n📱 @{me.username}\n🔧 Test mode: {TEST_MODE}\n🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\nPronto."
         )
     except Exception as e:
         print(f"[WARN] {e}")
