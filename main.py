@@ -75,11 +75,11 @@ async def send_split_messages(chat_id, text):
         await client.send_message(chat_id, part)
         if i < len(parts) - 1:
             if len(part) > 120:
-                delay = 5.0
+                delay = 7.0
             elif len(part) > 60:
-                delay = 3.5
+                delay = 5.0
             else:
-                delay = 2.0
+                delay = 3.0
             await asyncio.sleep(delay)
 
 
