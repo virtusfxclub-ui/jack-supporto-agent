@@ -64,14 +64,21 @@ async def transcribe_audio(file_path: str) -> str:
 
 
 async def send_split_messages(chat_id, text):
-    """Spezza il testo su doppio newline e manda messaggi separati"""
+    """Spezza il testo su doppio newline e manda messaggi separati con delay umano"""
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         return
     for i, part in enumerate(parts):
         await client.send_message(chat_id, part)
         if i < len(parts) - 1:
-            await asyncio.sleep(1.5)
+            # Delay basato sulla lunghezza del messaggio appena inviato
+            if len(part) > 120:
+                delay = 5.0
+            elif len(part) > 60:
+                delay = 3.5
+            else:
+                delay = 2.0
+            await asyncio.sleep(delay)
 
 
 async def process_messages(sender_id, sender_info, debounce):
@@ -162,7 +169,7 @@ async def handle_incoming(event):
 
         if event.message.media:
 
-            # ── IMMAGINE → notifica Jack, non rispondere al lead ──
+            # IMMAGINE → notifica Jack, non rispondere al lead
             if isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — notifico Jack")
                 caption = f" — didascalia: \"{message_text}\"" if message_text else ""
@@ -173,9 +180,9 @@ async def handle_incoming(event):
                     f"Vai nella chat e rispondi tu direttamente.\n"
                     f"Scrivi qui 'ok ripreso' quando vuoi che riprenda l'agent."
                 )
-                return  # Non processare oltre
+                return
 
-            # ── AUDIO → trascrivi con Whisper ──
+            # AUDIO → trascrivi con Whisper
             elif isinstance(event.message.media, MessageMediaDocument):
                 doc = event.message.media.document
                 mime = doc.mime_type if hasattr(doc, "mime_type") else ""
@@ -220,7 +227,6 @@ async def handle_incoming(event):
         if not message_text.strip():
             return
 
-        # Accumula messaggi
         if sender_id not in pending_messages:
             pending_messages[sender_id] = []
 
@@ -236,7 +242,6 @@ async def handle_incoming(event):
             "media_type": media_type
         }
 
-        # Cancella task precedente e crea nuovo
         if sender_id in pending_tasks and not pending_tasks[sender_id].done():
             pending_tasks[sender_id].cancel()
 
