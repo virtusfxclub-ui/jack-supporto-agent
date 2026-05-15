@@ -129,8 +129,14 @@ async def process_messages(sender_id, sender_info, debounce):
                     except Exception:
                         reply_text = ""
                     if reply_text:
-                        await send_split_messages(sender_id, reply_text)
-                        print(f"[MSG OUT] → {sender_info['full_name']}: {reply_text[:80]}")
+                        # Controlla se è un'escalation — prefisso [PAUSE]
+                        should_pause = reply_text.startswith("[PAUSE]")
+                        clean_reply = reply_text[7:].strip() if should_pause else reply_text
+                        await send_split_messages(sender_id, clean_reply)
+                        print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
+                        if should_pause:
+                            paused_leads.add(sender_id)
+                            print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
                     else:
                         print(f"[WARN] Nessuna reply ricevuta da n8n")
                 else:
