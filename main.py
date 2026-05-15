@@ -1,7 +1,6 @@
 import asyncio
 import aiohttp
 import os
-import base64
 import tempfile
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -15,9 +14,9 @@ SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
 
 DEBOUNCE_TEXT = 30
-DEBOUNCE_IMAGE = 20
 DEBOUNCE_EXTRA_AUDIO = 15
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -25,8 +24,21 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
 pending_tasks = {}
 
+
+async def notify_jack(text: str):
+    """Manda notifica nel gruppo Jack Agent Control via bot Telegram"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": CONTROL_CHAT_ID, "text": text}
+            )
+    except Exception as e:
+        print(f"[NOTIFY ERROR] {e}")
+
+
 async def transcribe_audio(file_path: str) -> str:
-    """Trascrive un file audio usando Whisper API di OpenAI"""
+    """Trascrive audio con Whisper API OpenAI"""
     try:
         with open(file_path, "rb") as audio_file:
             async with aiohttp.ClientSession() as session:
@@ -50,16 +62,9 @@ async def transcribe_audio(file_path: str) -> str:
         print(f"[WHISPER EXCEPTION] {e}")
         return ""
 
-async def encode_image_base64(file_path: str) -> str:
-    """Converte un'immagine in base64"""
-    try:
-        with open(file_path, "rb") as img_file:
-            return base64.b64encode(img_file.read()).decode("utf-8")
-    except Exception as e:
-        print(f"[IMAGE ENCODE ERROR] {e}")
-        return ""
 
 async def send_split_messages(chat_id, text):
+    """Spezza il testo su doppio newline e manda messaggi separati"""
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         return
@@ -68,14 +73,18 @@ async def send_split_messages(chat_id, text):
         if i < len(parts) - 1:
             await asyncio.sleep(1.5)
 
+
 async def process_messages(sender_id, sender_info, debounce):
+    """Aspetta debounce secondi poi processa tutti i messaggi accumulati"""
     await asyncio.sleep(debounce)
+
     if sender_id not in pending_messages or not pending_messages[sender_id]:
         return
+
     messages = pending_messages.pop(sender_id, [])
     pending_tasks.pop(sender_id, None)
+
     combined_text = "\n".join([m["text"] for m in messages if m.get("text")])
-    image_base64 = next((m.get("image_b64") for m in messages if m.get("image_b64")), None)
     media_type = messages[-1].get("media_type", "text")
 
     print(f"[MSG IN] {sender_info['full_name']}: {combined_text[:100]}")
@@ -87,8 +96,7 @@ async def process_messages(sender_id, sender_info, debounce):
         "sender_name": sender_info["first_name"],
         "chat_id": str(sender_id),
         "message_text": combined_text,
-        "media_type": media_type,
-        "image_base64": image_base64 or ""
+        "media_type": media_type
     }
 
     try:
@@ -114,16 +122,19 @@ async def process_messages(sender_id, sender_info, debounce):
     except Exception as e:
         print(f"[EXCEPTION] {e}")
 
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_incoming(event):
     try:
         if not event.is_private:
             return
+
         sender = await event.get_sender()
         if not isinstance(sender, User):
             return
         if sender.bot:
             return
+
         me = await client.get_me()
         if sender.id == me.id:
             return
@@ -148,28 +159,23 @@ async def handle_incoming(event):
         message_text = event.message.message or ""
         media_type = "text"
         debounce = DEBOUNCE_TEXT
-        image_b64 = None
 
         if event.message.media:
-            if isinstance(event.message.media, MessageMediaPhoto):
-                media_type = "immagine"
-                debounce = DEBOUNCE_IMAGE
-                print(f"[IMAGE] Scarico immagine da {full_name}...")
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
-                    await client.download_media(event.message, file=tmp_path)
-                    image_b64 = await encode_image_base64(tmp_path)
-                    os.unlink(tmp_path)
-                    if message_text:
-                        message_text = f"[L'utente ha inviato un'immagine con didascalia: {message_text}]"
-                    else:
-                        message_text = "[L'utente ha inviato un'immagine — descrivila e rispondi in base al contesto della conversazione]"
-                    print(f"[IMAGE] Immagine codificata, dimensione b64: {len(image_b64)} chars")
-                except Exception as e:
-                    print(f"[IMAGE ERROR] {e}")
-                    message_text = "[L'utente ha inviato un'immagine]"
 
+            # ── IMMAGINE → notifica Jack, non rispondere al lead ──
+            if isinstance(event.message.media, MessageMediaPhoto):
+                print(f"[IMAGE] Immagine da {full_name} — notifico Jack")
+                caption = f" — didascalia: \"{message_text}\"" if message_text else ""
+                await notify_jack(
+                    f"🖼 IMMAGINE RICEVUTA{caption}\n\n"
+                    f"👤 {full_name} (@{sender_username})\n"
+                    f"📱 ID: {sender_id}\n\n"
+                    f"Vai nella chat e rispondi tu direttamente.\n"
+                    f"Scrivi qui 'ok ripreso' quando vuoi che riprenda l'agent."
+                )
+                return  # Non processare oltre
+
+            # ── AUDIO → trascrivi con Whisper ──
             elif isinstance(event.message.media, MessageMediaDocument):
                 doc = event.message.media.document
                 mime = doc.mime_type if hasattr(doc, "mime_type") else ""
@@ -186,7 +192,7 @@ async def handle_incoming(event):
                         audio_duration = 30
 
                     debounce = audio_duration + DEBOUNCE_EXTRA_AUDIO
-                    print(f"[AUDIO] Durata: {audio_duration}s — scarico e trascrivo...")
+                    print(f"[AUDIO] Durata: {audio_duration}s — trascrivo con Whisper...")
 
                     if OPENAI_API_KEY:
                         try:
@@ -199,12 +205,12 @@ async def handle_incoming(event):
                                 message_text = f"[MESSAGGIO VOCALE TRASCRITTO]: {transcription}"
                                 print(f"[AUDIO] Trascrizione: {transcription[:100]}")
                             else:
-                                message_text = "[L'utente ha inviato un messaggio vocale ma la trascrizione è fallita — chiedi di ripetere per iscritto]"
+                                message_text = "[Messaggio vocale non trascritto — chiedi di ripetere per iscritto]"
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
-                            message_text = "[L'utente ha inviato un messaggio vocale — chiedi di ripetere per iscritto]"
+                            message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
                     else:
-                        message_text = "[L'utente ha inviato un messaggio vocale — chiedi di ripetere per iscritto]"
+                        message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
 
                 else:
                     media_type = "documento"
@@ -214,13 +220,13 @@ async def handle_incoming(event):
         if not message_text.strip():
             return
 
+        # Accumula messaggi
         if sender_id not in pending_messages:
             pending_messages[sender_id] = []
 
         pending_messages[sender_id].append({
             "text": message_text,
-            "media_type": media_type,
-            "image_b64": image_b64
+            "media_type": media_type
         })
 
         sender_info = {
@@ -230,6 +236,7 @@ async def handle_incoming(event):
             "media_type": media_type
         }
 
+        # Cancella task precedente e crea nuovo
         if sender_id in pending_tasks and not pending_tasks[sender_id].done():
             pending_tasks[sender_id].cancel()
 
@@ -242,33 +249,50 @@ async def handle_incoming(event):
     except Exception as e:
         print(f"[EXCEPTION] {e}")
 
+
 @client.on(events.NewMessage(chats=CONTROL_CHAT_ID))
 async def handle_control(event):
     text = event.message.message or ""
     if text.startswith("/stato"):
         me = await client.get_me()
-        await event.reply(f"🤖 Jack Agent attivo\n📱 @{me.username}\n✅ Tutto operativo")
+        await event.reply(
+            f"🤖 Jack Agent attivo\n"
+            f"📱 @{me.username}\n"
+            f"🔧 Test mode: {TEST_MODE}\n"
+            f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"✅ Tutto operativo"
+        )
+
 
 async def main():
     print("🚀 Jack Supporto Agent avviato")
     await client.connect()
+
     authorized = await client.is_user_authorized()
     if not authorized:
         print("[ERROR] Sessione non autorizzata — rigenera la session string")
         return
+
     me = await client.get_me()
     print(f"✅ Connesso come {me.first_name} (@{me.username})")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
-    print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio: durata+{DEBOUNCE_EXTRA_AUDIO}s | immagine: {DEBOUNCE_IMAGE}s")
+    print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio: durata+{DEBOUNCE_EXTRA_AUDIO}s")
+
     try:
         await client.send_message(
             CONTROL_CHAT_ID,
-            f"🟢 Jack Agent online\n📱 @{me.username}\n🔧 Test mode: {TEST_MODE}\n🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\nPronto."
+            f"🟢 Jack Agent online\n"
+            f"📱 @{me.username}\n"
+            f"🔧 Test mode: {TEST_MODE}\n"
+            f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"Pronto."
         )
     except Exception as e:
         print(f"[WARN] {e}")
+
     await client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
