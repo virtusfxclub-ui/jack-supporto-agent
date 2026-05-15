@@ -24,6 +24,9 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
 pending_tasks = {}
 
+# Lead in pausa — non rispondono finché Jack non dice "riprendi"
+paused_leads = set()
+
 
 async def notify_jack(text: str):
     """Manda notifica nel gruppo Jack Agent Control via bot Telegram"""
@@ -71,7 +74,6 @@ async def send_split_messages(chat_id, text):
     for i, part in enumerate(parts):
         await client.send_message(chat_id, part)
         if i < len(parts) - 1:
-            # Delay basato sulla lunghezza del messaggio appena inviato
             if len(part) > 120:
                 delay = 5.0
             elif len(part) > 60:
@@ -84,6 +86,13 @@ async def send_split_messages(chat_id, text):
 async def process_messages(sender_id, sender_info, debounce):
     """Aspetta debounce secondi poi processa tutti i messaggi accumulati"""
     await asyncio.sleep(debounce)
+
+    # Controlla se il lead è in pausa
+    if sender_id in paused_leads:
+        print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
+        pending_messages.pop(sender_id, None)
+        pending_tasks.pop(sender_id, None)
+        return
 
     if sender_id not in pending_messages or not pending_messages[sender_id]:
         return
@@ -163,22 +172,34 @@ async def handle_incoming(event):
             print(f"[SKIP VIP] {full_name}")
             return
 
+        # Se il lead è in pausa, notifica Jack silenziosamente
+        if sender_id in paused_leads:
+            print(f"[PAUSED] {full_name} ha scritto ma è in pausa")
+            await notify_jack(
+                f"⏸ LEAD IN PAUSA HA SCRITTO\n\n"
+                f"👤 {full_name} (@{sender_username})\n"
+                f"💬 Ha scritto: {event.message.message or '[media]'}\n\n"
+                f"Scrivi 'riprendi {sender_id}' per riattivare l'agent."
+            )
+            return
+
         message_text = event.message.message or ""
         media_type = "text"
         debounce = DEBOUNCE_TEXT
 
         if event.message.media:
 
-            # IMMAGINE → notifica Jack, non rispondere al lead
+            # IMMAGINE → metti in pausa e notifica Jack
             if isinstance(event.message.media, MessageMediaPhoto):
-                print(f"[IMAGE] Immagine da {full_name} — notifico Jack")
+                print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
+                paused_leads.add(sender_id)
                 caption = f" — didascalia: \"{message_text}\"" if message_text else ""
                 await notify_jack(
                     f"🖼 IMMAGINE RICEVUTA{caption}\n\n"
                     f"👤 {full_name} (@{sender_username})\n"
                     f"📱 ID: {sender_id}\n\n"
                     f"Vai nella chat e rispondi tu direttamente.\n"
-                    f"Scrivi qui 'ok ripreso' quando vuoi che riprenda l'agent."
+                    f"Scrivi 'riprendi {sender_id}' quando vuoi che riprenda l'agent."
                 )
                 return
 
@@ -257,14 +278,34 @@ async def handle_incoming(event):
 
 @client.on(events.NewMessage(chats=CONTROL_CHAT_ID))
 async def handle_control(event):
+    """Gestisce comandi dal gruppo Jack Agent Control"""
     text = event.message.message or ""
-    if text.startswith("/stato"):
+
+    # Comando riprendi
+    if text.lower().startswith("riprendi"):
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                sender_id = int(parts[1])
+                if sender_id in paused_leads:
+                    paused_leads.discard(sender_id)
+                    await event.reply(f"✅ Agent riattivato per ID {sender_id} — risponderà al prossimo messaggio")
+                    print(f"[RESUME] Lead {sender_id} riattivato")
+                else:
+                    await event.reply(f"Il lead {sender_id} non era in pausa")
+            except ValueError:
+                await event.reply("Formato: riprendi [sender_id]")
+
+    # Comando stato
+    elif text.startswith("/stato"):
         me = await client.get_me()
+        paused_list = ", ".join(str(x) for x in paused_leads) if paused_leads else "nessuno"
         await event.reply(
             f"🤖 Jack Agent attivo\n"
             f"📱 @{me.username}\n"
             f"🔧 Test mode: {TEST_MODE}\n"
             f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"⏸ Lead in pausa: {paused_list}\n"
             f"✅ Tutto operativo"
         )
 
