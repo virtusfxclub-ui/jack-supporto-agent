@@ -4,7 +4,7 @@ import os
 import tempfile
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument, MessageMediaVideo
+from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
