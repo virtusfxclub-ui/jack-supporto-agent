@@ -4,7 +4,7 @@ import os
 import tempfile
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument, MessageMediaVideo
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
@@ -23,13 +23,10 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 pending_messages = {}
 pending_tasks = {}
-
-# Lead in pausa — non rispondono finché Jack non dice "riprendi"
 paused_leads = set()
 
 
 async def notify_jack(text: str):
-    """Manda notifica nel gruppo Jack Agent Control via bot Telegram"""
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(
@@ -40,13 +37,12 @@ async def notify_jack(text: str):
         print(f"[NOTIFY ERROR] {e}")
 
 
-async def transcribe_audio(file_path: str) -> str:
-    """Trascrive audio con Whisper API OpenAI"""
+async def transcribe_audio(file_path: str, content_type: str = "audio/ogg", filename: str = "audio.ogg") -> str:
     try:
         with open(file_path, "rb") as audio_file:
             async with aiohttp.ClientSession() as session:
                 data = aiohttp.FormData()
-                data.add_field("file", audio_file, filename="audio.ogg", content_type="audio/ogg")
+                data.add_field("file", audio_file, filename=filename, content_type=content_type)
                 data.add_field("model", "whisper-1")
                 data.add_field("language", "it")
                 async with session.post(
@@ -66,8 +62,24 @@ async def transcribe_audio(file_path: str) -> str:
         return ""
 
 
+async def extract_audio_from_video(video_path: str) -> str:
+    try:
+        audio_path = video_path + "_audio.mp3"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", video_path, "-vn", "-acodec", "mp3", "-y", audio_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.wait()
+        if proc.returncode == 0 and os.path.exists(audio_path):
+            return audio_path
+        return ""
+    except Exception as e:
+        print(f"[FFMPEG ERROR] {e}")
+        return ""
+
+
 async def send_split_messages(chat_id, text):
-    """Spezza il testo su doppio newline e manda messaggi separati con delay umano"""
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         return
@@ -84,10 +96,8 @@ async def send_split_messages(chat_id, text):
 
 
 async def process_messages(sender_id, sender_info, debounce):
-    """Aspetta debounce secondi poi processa tutti i messaggi accumulati"""
     await asyncio.sleep(debounce)
 
-    # Controlla se il lead è in pausa
     if sender_id in paused_leads:
         print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
         pending_messages.pop(sender_id, None)
@@ -129,7 +139,6 @@ async def process_messages(sender_id, sender_info, debounce):
                     except Exception:
                         reply_text = ""
                     if reply_text:
-                        # Controlla se è un'escalation — prefisso [PAUSE]
                         should_pause = reply_text.startswith("[PAUSE]")
                         clean_reply = reply_text[7:].strip() if should_pause else reply_text
                         await send_split_messages(sender_id, clean_reply)
@@ -178,7 +187,6 @@ async def handle_incoming(event):
             print(f"[SKIP VIP] {full_name}")
             return
 
-        # Se il lead è in pausa, notifica Jack silenziosamente
         if sender_id in paused_leads:
             print(f"[PAUSED] {full_name} ha scritto ma è in pausa")
             await notify_jack(
@@ -195,7 +203,7 @@ async def handle_incoming(event):
 
         if event.message.media:
 
-            # IMMAGINE → metti in pausa e notifica Jack
+            # IMMAGINE → pausa e notifica Jack
             if isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
                 paused_leads.add(sender_id)
@@ -209,11 +217,11 @@ async def handle_incoming(event):
                 )
                 return
 
-            # AUDIO → trascrivi con Whisper
             elif isinstance(event.message.media, MessageMediaDocument):
                 doc = event.message.media.document
                 mime = doc.mime_type if hasattr(doc, "mime_type") else ""
 
+                # AUDIO VOCALE
                 if "audio" in mime or "ogg" in mime or "voice" in mime:
                     media_type = "audio"
                     audio_duration = 0
@@ -245,6 +253,44 @@ async def handle_incoming(event):
                             message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
                     else:
                         message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
+
+                # VIDEO MESSAGGIO
+                elif "video" in mime or mime == "video/mp4":
+                    media_type = "video"
+                    video_duration = 0
+                    try:
+                        for attr in doc.attributes:
+                            if hasattr(attr, "duration"):
+                                video_duration = int(attr.duration)
+                                break
+                    except Exception:
+                        video_duration = 30
+
+                    debounce = video_duration + DEBOUNCE_EXTRA_AUDIO
+                    print(f"[VIDEO] Durata: {video_duration}s — estraggo audio e trascrivo...")
+
+                    if OPENAI_API_KEY:
+                        try:
+                            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                                tmp_path = tmp.name
+                            await client.download_media(event.message, file=tmp_path)
+                            audio_path = await extract_audio_from_video(tmp_path)
+                            os.unlink(tmp_path)
+                            if audio_path:
+                                transcription = await transcribe_audio(audio_path, "audio/mpeg", "audio.mp3")
+                                os.unlink(audio_path)
+                                if transcription:
+                                    message_text = f"[VIDEO MESSAGGIO TRASCRITTO]: {transcription}"
+                                    print(f"[VIDEO] Trascrizione: {transcription[:100]}")
+                                else:
+                                    message_text = "[Video messaggio non trascritto — chiedi di ripetere per iscritto]"
+                            else:
+                                message_text = "[Video messaggio — chiedi di ripetere per iscritto]"
+                        except Exception as e:
+                            print(f"[VIDEO ERROR] {e}")
+                            message_text = "[Video messaggio — chiedi di ripetere per iscritto]"
+                    else:
+                        message_text = "[Video messaggio — chiedi di ripetere per iscritto]"
 
                 else:
                     media_type = "documento"
@@ -284,10 +330,8 @@ async def handle_incoming(event):
 
 @client.on(events.NewMessage(chats=CONTROL_CHAT_ID))
 async def handle_control(event):
-    """Gestisce comandi dal gruppo Jack Agent Control"""
     text = event.message.message or ""
 
-    # Comando riprendi
     if text.lower().startswith("riprendi"):
         parts = text.split()
         if len(parts) >= 2:
@@ -302,7 +346,6 @@ async def handle_control(event):
             except ValueError:
                 await event.reply("Formato: riprendi [sender_id]")
 
-    # Comando stato
     elif text.startswith("/stato"):
         me = await client.get_me()
         paused_list = ", ".join(str(x) for x in paused_leads) if paused_leads else "nessuno"
@@ -329,7 +372,8 @@ async def main():
     print(f"✅ Connesso come {me.first_name} (@{me.username})")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
-    print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio: durata+{DEBOUNCE_EXTRA_AUDIO}s")
+    print(f"🎥 Video: {'attivo con ffmpeg' if OPENAI_API_KEY else 'non configurato'}")
+    print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio/video: durata+{DEBOUNCE_EXTRA_AUDIO}s")
 
     try:
         await client.send_message(
@@ -337,7 +381,7 @@ async def main():
             f"🟢 Jack Agent online\n"
             f"📱 @{me.username}\n"
             f"🔧 Test mode: {TEST_MODE}\n"
-            f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"🎤 Whisper + Video: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
             f"Pronto."
         )
     except Exception as e:
