@@ -138,18 +138,30 @@ async def process_messages(sender_id, sender_info, debounce):
                         reply_text = reply_text.strip()
                     except Exception:
                         reply_text = ""
-                    if reply_text:
-                        should_pause = reply_text.startswith("[PAUSE]")
-                        clean_reply = reply_text[7:].strip() if should_pause else reply_text
-                        await send_split_messages(sender_id, clean_reply)
-                        print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
-                        if should_pause:
-                            paused_leads.add(sender_id)
-                            print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
-                    else:
+
+                    if not reply_text:
                         print(f"[WARN] Nessuna reply ricevuta da n8n")
+                        return
+
+                    # Gestione comandi speciali
+                    if reply_text.startswith("[BLOCK]"):
+                        paused_leads.add(sender_id)
+                        print(f"[BLOCKED] {sender_info['full_name']} bloccato — proposta commerciale")
+                        return
+
+                    if reply_text.startswith("[PAUSE]"):
+                        clean_reply = reply_text[7:].strip()
+                        await send_split_messages(sender_id, clean_reply)
+                        paused_leads.add(sender_id)
+                        print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
+                        return
+
+                    await send_split_messages(sender_id, reply_text)
+                    print(f"[MSG OUT] → {sender_info['full_name']}: {reply_text[:80]}")
+
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
+
     except Exception as e:
         print(f"[EXCEPTION] {e}")
 
