@@ -2,6 +2,8 @@ import asyncio
 import aiohttp
 import os
 import tempfile
+from datetime import datetime
+import pytz
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
@@ -18,12 +20,65 @@ TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
 
 DEBOUNCE_TEXT = 30
 DEBOUNCE_EXTRA_AUDIO = 15
+MAX_HISTORY_MESSAGES = 50
+ITALY_TZ = pytz.timezone("Europe/Rome")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 pending_messages = {}
 pending_tasks = {}
 paused_leads = set()
+
+
+def is_night_time():
+    """Controlla se è notte in Italia (00:00 - 08:00)"""
+    now = datetime.now(ITALY_TZ)
+    return 0 <= now.hour < 8
+
+
+def get_night_bridge_message(first_name: str, context_hint: str = "") -> str:
+    """Restituisce il messaggio bridge notturno appropriato in base all'ora"""
+    name = first_name or ""
+    context_lower = context_hint.lower()
+    now = datetime.now(ITALY_TZ)
+    hour = now.hour
+
+    if any(k in context_lower for k in ['registr', 'link', 'iniziare', 'partire', 'procedo']):
+        action = "ti giro il link per iniziare"
+    elif any(k in context_lower for k in ['mail', 'referral', 'puprime', 'cambio', 'conto']):
+        action = "ti mando la mail da inviare"
+    elif any(k in context_lower for k in ['chiamata', 'audio', 'telefono', 'videochiamata']):
+        action = "ti scrivo"
+    else:
+        action = "ti rispondo"
+
+    if 0 <= hour < 3:
+        return f"Guarda {name}, sto andando a letto adesso. Domattina ti scrivo io personalmente e {action}, ok?"
+    else:
+        return f"Guarda {name}, domattina appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
+
+
+async def get_chat_history(sender_id: int) -> str:
+    """Carica la cronologia della chat esistente da Telethon"""
+    try:
+        me = await client.get_me()
+        messages = []
+        async for msg in client.iter_messages(sender_id, limit=MAX_HISTORY_MESSAGES):
+            if msg.text:
+                sender = "Jack" if msg.out else "Lead"
+                messages.append(f"{sender}: {msg.text}")
+
+        if not messages:
+            return ""
+
+        # Inverti per avere ordine cronologico
+        messages.reverse()
+        history = " | ".join(messages)
+        print(f"[HISTORY] Caricati {len(messages)} messaggi dalla chat")
+        return history
+    except Exception as e:
+        print(f"[HISTORY ERROR] {e}")
+        return ""
 
 
 async def notify_jack(text: str):
@@ -115,6 +170,9 @@ async def process_messages(sender_id, sender_info, debounce):
 
     print(f"[MSG IN] {sender_info['full_name']}: {combined_text[:100]}")
 
+    # Carica storico chat Telethon se disponibile
+    chat_history = await get_chat_history(sender_id)
+
     payload = {
         "sender_id": str(sender_id),
         "sender_username": sender_info["username"],
@@ -122,7 +180,8 @@ async def process_messages(sender_id, sender_info, debounce):
         "sender_name": sender_info["first_name"],
         "chat_id": str(sender_id),
         "message_text": combined_text,
-        "media_type": media_type
+        "media_type": media_type,
+        "telegram_history": chat_history
     }
 
     try:
@@ -143,14 +202,23 @@ async def process_messages(sender_id, sender_info, debounce):
                         print(f"[WARN] Nessuna reply ricevuta da n8n")
                         return
 
-                    # Gestione comandi speciali
+                    # Gestione BLOCK — proposta commerciale
                     if reply_text.startswith("[BLOCK]"):
                         paused_leads.add(sender_id)
-                        print(f"[BLOCKED] {sender_info['full_name']} bloccato — proposta commerciale")
+                        print(f"[BLOCKED] {sender_info['full_name']} bloccato")
                         return
 
+                    # Gestione PAUSE — escalation
                     if reply_text.startswith("[PAUSE]"):
                         clean_reply = reply_text[7:].strip()
+
+                        # Se è notte sostituisci con messaggio notturno
+                        if is_night_time():
+                            clean_reply = get_night_bridge_message(
+                                sender_info["first_name"],
+                                combined_text
+                            )
+
                         await send_split_messages(sender_id, clean_reply)
                         paused_leads.add(sender_id)
                         print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
@@ -215,7 +283,6 @@ async def handle_incoming(event):
 
         if event.message.media:
 
-            # IMMAGINE → pausa e notifica Jack
             if isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
                 paused_leads.add(sender_id)
@@ -233,7 +300,6 @@ async def handle_incoming(event):
                 doc = event.message.media.document
                 mime = doc.mime_type if hasattr(doc, "mime_type") else ""
 
-                # AUDIO VOCALE
                 if "audio" in mime or "ogg" in mime or "voice" in mime:
                     media_type = "audio"
                     audio_duration = 0
@@ -266,7 +332,6 @@ async def handle_incoming(event):
                     else:
                         message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
 
-                # VIDEO MESSAGGIO
                 elif "video" in mime or mime == "video/mp4":
                     media_type = "video"
                     video_duration = 0
@@ -361,11 +426,13 @@ async def handle_control(event):
     elif text.startswith("/stato"):
         me = await client.get_me()
         paused_list = ", ".join(str(x) for x in paused_leads) if paused_leads else "nessuno"
+        night = "sì" if is_night_time() else "no"
         await event.reply(
             f"🤖 Jack Agent attivo\n"
             f"📱 @{me.username}\n"
             f"🔧 Test mode: {TEST_MODE}\n"
             f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"🌙 Modalità notte: {night}\n"
             f"⏸ Lead in pausa: {paused_list}\n"
             f"✅ Tutto operativo"
         )
@@ -384,8 +451,8 @@ async def main():
     print(f"✅ Connesso come {me.first_name} (@{me.username})")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
-    print(f"🎥 Video: {'attivo con ffmpeg' if OPENAI_API_KEY else 'non configurato'}")
-    print(f"⏱ Debounce testo: {DEBOUNCE_TEXT}s | audio/video: durata+{DEBOUNCE_EXTRA_AUDIO}s")
+    print(f"🌙 Modalità notte attiva: {is_night_time()}")
+    print(f"📖 Max messaggi storia: {MAX_HISTORY_MESSAGES}")
 
     try:
         await client.send_message(
@@ -394,6 +461,7 @@ async def main():
             f"📱 @{me.username}\n"
             f"🔧 Test mode: {TEST_MODE}\n"
             f"🎤 Whisper + Video: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
+            f"📖 Storico chat: {MAX_HISTORY_MESSAGES} messaggi\n"
             f"Pronto."
         )
     except Exception as e:
