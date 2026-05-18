@@ -234,20 +234,17 @@ async def process_messages(sender_id, sender_info, debounce):
                     if should_send_storico:
                         await asyncio.sleep(2)
                         try:
-                            # Carica tutti i messaggi salvati e forwardali in sequenza
-                            saved_messages = []
-                            async for msg in client.iter_messages('me', limit=50):
-                                saved_messages.append(msg)
-                            
-                            if saved_messages:
-                                # Inverti per inviare in ordine cronologico
-                                saved_messages.reverse()
-                                for msg in saved_messages:
-                                    await client.forward_messages(sender_id, msg, 'me')
-                                    await asyncio.sleep(1)
-                                print(f"[STORICO] Inviati {len(saved_messages)} messaggi storico a {sender_info['full_name']}")
+                            import os
+                            pdf_path = "/app/assets/storico.pdf"
+                            if os.path.exists(pdf_path):
+                                await client.send_file(
+                                    sender_id,
+                                    pdf_path,
+                                    caption="Virtus FX Club — Performance Report Dic 2025 / Apr 2026"
+                                )
+                                print(f"[STORICO] PDF inviato a {sender_info['full_name']}")
                             else:
-                                print(f"[STORICO] Nessun messaggio trovato nei messaggi salvati")
+                                print(f"[STORICO] PDF non trovato in {pdf_path}")
                         except Exception as e:
                             print(f"[STORICO ERROR] {e}")
 
