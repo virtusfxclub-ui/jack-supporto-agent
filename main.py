@@ -235,7 +235,7 @@ async def process_messages(sender_id, sender_info, debounce):
                         await asyncio.sleep(2)
                         try:
                             import os
-                            pdf_path = "/app/assets/storico.pdf"
+                            pdf_path = "/app/storico.pdf"
                             if os.path.exists(pdf_path):
                                 await client.send_file(
                                     sender_id,
