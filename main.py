@@ -224,8 +224,30 @@ async def process_messages(sender_id, sender_info, debounce):
                         print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
                         return
 
-                    await send_split_messages(sender_id, reply_text)
-                    print(f"[MSG OUT] → {sender_info['full_name']}: {reply_text[:80]}")
+                    # Gestione STORICO_LEAD — manda risposta rapida /STORICO
+                    should_send_storico = '[STORICO_LEAD]' in reply_text
+                    clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
+
+                    await send_split_messages(sender_id, clean_reply)
+                    print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
+
+                    if should_send_storico:
+                        await asyncio.sleep(2)
+                        try:
+                            # Recupera la risposta rapida /STORICO dai messaggi salvati
+                            saved_messages = await client.get_messages('me', search='/STORICO', limit=5)
+                            storico_msg = None
+                            for msg in saved_messages:
+                                if msg.text and '/STORICO' in msg.text:
+                                    storico_msg = msg
+                                    break
+                            if storico_msg:
+                                await client.forward_messages(sender_id, storico_msg, 'me')
+                                print(f"[STORICO] Inviato storico a {sender_info['full_name']}")
+                            else:
+                                print(f"[STORICO] Messaggio /STORICO non trovato nei messaggi salvati")
+                        except Exception as e:
+                            print(f"[STORICO ERROR] {e}")
 
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
