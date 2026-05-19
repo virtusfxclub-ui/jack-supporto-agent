@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import os
 import tempfile
+from aiohttp import web
 from datetime import datetime
 import pytz
 from telethon import TelegramClient, events
@@ -17,6 +18,7 @@ TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
+PORT = int(os.environ.get("FOLLOWUP_SERVER_PORT", "8080"))
 
 DEBOUNCE_TEXT = 30
 DEBOUNCE_EXTRA_AUDIO = 15
@@ -459,6 +461,40 @@ async def handle_control(event):
         )
 
 
+async def handle_send_followup(request: web.Request) -> web.Response:
+    """POST /send-followup — manda messaggio follow-up come @jacksupporto"""
+    try:
+        body = await request.json()
+        chat_id = body.get("chat_id") or body.get("chatId")
+        message = body.get("message") or body.get("followupMsg") or body.get("text")
+        if not chat_id or not message:
+            return web.json_response({"ok": False, "error": "chat_id e message obbligatori"}, status=400)
+        chat_id = int(chat_id)
+        print(f"[FOLLOWUP] Invio a {chat_id}: {message[:80]}")
+        await client.send_message(chat_id, message)
+        print(f"[FOLLOWUP] Inviato a {chat_id}")
+        return web.json_response({"ok": True})
+    except Exception as e:
+        print(f"[HTTP ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def handle_healthcheck(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "jack-supporto-agent"})
+
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_post("/send-followup", handle_send_followup)
+    app.router.add_get("/health", handle_healthcheck)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[HTTP] Server avviato su 0.0.0.0:{PORT}")
+    return runner
+
+
 async def main():
     print("🚀 Jack Supporto Agent avviato")
     await client.connect()
@@ -474,6 +510,7 @@ async def main():
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
     print(f"🌙 Modalità notte attiva: {is_night_time()}")
     print(f"📖 Max messaggi storia: {MAX_HISTORY_MESSAGES}")
+    print(f"🌐 HTTP follow-up porta: {PORT}")
 
     try:
         await client.send_message(
@@ -483,12 +520,17 @@ async def main():
             f"🔧 Test mode: {TEST_MODE}\n"
             f"🎤 Whisper + Video: {'attivo' if OPENAI_API_KEY else 'non configurato'}\n"
             f"📖 Storico chat: {MAX_HISTORY_MESSAGES} messaggi\n"
+            f"🌐 HTTP follow-up: porta {PORT}\n"
             f"Pronto."
         )
     except Exception as e:
         print(f"[WARN] {e}")
 
-    await client.run_until_disconnected()
+    http_runner = await start_http_server()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        await http_runner.cleanup()
 
 
 if __name__ == "__main__":
