@@ -20,9 +20,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
 PORT = int(os.environ.get("FOLLOWUP_SERVER_PORT", "8080"))
 
-DEBOUNCE_TEXT = 60
+DEBOUNCE_TEXT = 30
 DEBOUNCE_EXTRA_AUDIO = 15
-MAX_HISTORY_MESSAGES = 150
+MAX_HISTORY_MESSAGES = 50
 ITALY_TZ = pytz.timezone("Europe/Rome")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -83,6 +83,30 @@ async def get_chat_history(sender_id: int) -> str:
         return ""
 
 
+async def update_airtable_vip(chat_id: str):
+    """Aggiorna lo stato del lead VIP su Airtable a cliente"""
+    try:
+        search_url = f"https://api.airtable.com/v0/appxEMWaNLn7X9a31/Leads"
+        headers = {"Authorization": f"Bearer {os.environ.get('AIRTABLE_TOKEN', '')}"}
+        params = {"filterByFormula": f"{{chat_id}}='{chat_id}'"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    records = data.get("records", [])
+                    if records:
+                        record_id = records[0]["id"]
+                        patch_url = f"{search_url}/{record_id}"
+                        patch_data = {"fields": {"stato": "cliente"}}
+                        async with session.patch(patch_url, headers={**headers, "Content-Type": "application/json"}, json=patch_data) as patch_resp:
+                            if patch_resp.status == 200:
+                                print(f"[AIRTABLE] Lead {chat_id} aggiornato a cliente")
+                            else:
+                                print(f"[AIRTABLE ERROR] Status: {patch_resp.status}")
+    except Exception as e:
+        print(f"[AIRTABLE VIP ERROR] {e}")
+
+
 async def notify_jack(text: str):
     try:
         async with aiohttp.ClientSession() as session:
@@ -136,7 +160,24 @@ async def extract_audio_from_video(video_path: str) -> str:
         return ""
 
 
+def clean_dashes(text: str) -> str:
+    """Rimuove tutti i tipi di trattino usati come separatori e li converte in virgola"""
+    import re
+    # Em dash e en dash con spazi attorno
+    text = re.sub(r'\s*—\s*', ', ', text)
+    text = re.sub(r'\s*–\s*', ', ', text)
+    # Trattino normale con spazi attorno (es. "ciao - come stai")
+    text = re.sub(r' - ', ', ', text)
+    # Trattino a inizio riga (elenchi puntati tipo "- cosa")
+    text = re.sub(r'(?m)^- ', '', text)
+    # Pulizia doppia virgola o virgola a inizio frase
+    text = re.sub(r',\s*,', ',', text)
+    text = re.sub(r'^\s*,\s*', '', text)
+    return text.strip()
+
+
 async def send_split_messages(chat_id, text):
+    text = clean_dashes(text)
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         return
@@ -287,7 +328,9 @@ async def handle_incoming(event):
             print(f"[TEST MODE] Messaggio da tester: {full_name}")
 
         if "VIP" in full_name.upper():
-            print(f"[SKIP VIP] {full_name}")
+            print(f"[SKIP VIP] {full_name} — aggiorno Airtable a cliente")
+            # Aggiorna automaticamente lo stato su Airtable a cliente
+            asyncio.create_task(update_airtable_vip(str(sender_id)))
             return
 
         if sender_id in paused_leads:
