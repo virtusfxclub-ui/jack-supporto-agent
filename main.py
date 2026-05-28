@@ -20,9 +20,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
 PORT = int(os.environ.get("FOLLOWUP_SERVER_PORT", "8080"))
 
-DEBOUNCE_TEXT = 60
+DEBOUNCE_TEXT = 30
 DEBOUNCE_EXTRA_AUDIO = 15
-MAX_HISTORY_MESSAGES = 150
+MAX_HISTORY_MESSAGES = 50
 ITALY_TZ = pytz.timezone("Europe/Rome")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -183,6 +183,13 @@ async def send_split_messages(chat_id, text):
         return
     for i, part in enumerate(parts):
         await client.send_message(chat_id, part)
+        # Traccia questo messaggio come inviato dall'agent
+        if chat_id not in agent_messages:
+            agent_messages[chat_id] = []
+        agent_messages[chat_id].append(part.strip())
+        # Mantieni solo gli ultimi 200 messaggi per chat per non occupare troppa memoria
+        if len(agent_messages[chat_id]) > 200:
+            agent_messages[chat_id] = agent_messages[chat_id][-200:]
         if i < len(parts) - 1:
             if len(part) > 120:
                 delay = 7.0
@@ -552,11 +559,17 @@ async def handle_get_chats(request: web.Request) -> web.Response:
                 continue
             
             messages = []
+            chat_agent_msgs = agent_messages.get(dialog.entity.id, [])
             async for msg in client.iter_messages(dialog.entity, limit=50):
                 if not msg.date or msg.date.timestamp() < cutoff:
                     break
                 if msg.text:
-                    sender = "Jack" if msg.out else dialog.entity.first_name or "Lead"
+                    if msg.out:
+                        # Controlla se è un messaggio dell'agent o di Jack
+                        is_agent = msg.text.strip() in chat_agent_msgs
+                        sender = "Agent" if is_agent else "Jack (manuale)"
+                    else:
+                        sender = dialog.entity.first_name or "Lead"
                     messages.append({
                         "sender": sender,
                         "text": msg.text,
@@ -580,8 +593,7 @@ async def handle_get_chats(request: web.Request) -> web.Response:
 async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
-    app.router.add_get("/health",         handle_healthcheck)
-    app.router.add_get("/get-chats",      handle_get_chats)
+    app.router.add_get("/health", handle_healthcheck)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
