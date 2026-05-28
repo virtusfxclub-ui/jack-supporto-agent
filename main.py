@@ -580,7 +580,8 @@ async def handle_get_chats(request: web.Request) -> web.Response:
 async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
-    app.router.add_get("/health", handle_healthcheck)
+    app.router.add_get("/health",         handle_healthcheck)
+    app.router.add_get("/get-chats",      handle_get_chats)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
