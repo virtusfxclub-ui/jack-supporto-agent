@@ -526,6 +526,57 @@ async def handle_healthcheck(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "service": "jack-supporto-agent"})
 
 
+async def handle_get_chats(request: web.Request) -> web.Response:
+    """
+    GET /get-chats?hours=8
+    Restituisce tutte le conversazioni private degli ultimi X ore
+    """
+    try:
+        hours = int(request.rel_url.query.get("hours", "8"))
+        cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
+        
+        chats_data = []
+        
+        async for dialog in client.iter_dialogs(limit=100):
+            if not dialog.is_user:
+                continue
+            if dialog.entity.bot:
+                continue
+                
+            me = await client.get_me()
+            if dialog.entity.id == me.id:
+                continue
+            
+            # Controlla se ci sono messaggi recenti
+            if dialog.date and dialog.date.timestamp() < cutoff:
+                continue
+            
+            messages = []
+            async for msg in client.iter_messages(dialog.entity, limit=50):
+                if not msg.date or msg.date.timestamp() < cutoff:
+                    break
+                if msg.text:
+                    sender = "Jack" if msg.out else dialog.entity.first_name or "Lead"
+                    messages.append({
+                        "sender": sender,
+                        "text": msg.text,
+                        "time": msg.date.strftime("%H:%M")
+                    })
+            
+            if messages:
+                messages.reverse()
+                chats_data.append({
+                    "nome": f"{dialog.entity.first_name or ''} {dialog.entity.last_name or ''}".strip(),
+                    "messaggi": messages
+                })
+        
+        return web.json_response({"ok": True, "chats": chats_data, "hours": hours})
+    
+    except Exception as e:
+        print(f"[GET-CHATS ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
