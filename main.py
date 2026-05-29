@@ -30,6 +30,7 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
 pending_tasks = {}
 paused_leads = set()
+agent_messages   = {}
 
 
 def is_night_time():
