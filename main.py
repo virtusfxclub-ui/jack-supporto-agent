@@ -479,6 +479,7 @@ async def handle_get_folder_status(request: web.Request) -> web.Response:
                         folder_map[str(peer_id)] = folder_title
 
         chats_data = []
+        cutoff_30d = datetime.now(ITALY_TZ).timestamp() - (30 * 24 * 3600)
         async for dialog in client.iter_dialogs(limit=200):
             if not dialog.is_user:
                 continue
@@ -486,6 +487,9 @@ async def handle_get_folder_status(request: web.Request) -> web.Response:
                 continue
             me = await client.get_me()
             if dialog.entity.id == me.id:
+                continue
+            # Salta dialoghi senza attività negli ultimi 30 giorni (riduce carico)
+            if dialog.date and dialog.date.timestamp() < cutoff_30d:
                 continue
 
             chat_id = str(dialog.entity.id)
@@ -562,6 +566,55 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+async def handle_get_single_chat(request: web.Request) -> web.Response:
+    """
+    GET /get-single-chat?chat_id=123456&hours=72
+    Restituisce SOLO la chat specificata, senza scansionare tutti i dialoghi.
+    Molto più veloce di /get-chats quando serve una sola chat.
+    """
+    try:
+        chat_id_str = request.rel_url.query.get("chat_id", "")
+        if not chat_id_str:
+            return web.json_response({"ok": False, "error": "chat_id mancante"}, status=400)
+
+        chat_id = int(chat_id_str)
+        hours = int(request.rel_url.query.get("hours", "72"))
+        cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
+
+        entity = await client.get_entity(chat_id)
+        chat_agent_msgs = agent_messages.get(chat_id, [])
+
+        messages = []
+        async for msg in client.iter_messages(entity, limit=10):
+            if not msg.date or msg.date.timestamp() < cutoff:
+                break
+            if msg.text:
+                if msg.out:
+                    is_agent = msg.text.strip() in chat_agent_msgs
+                    sender = "Agent" if is_agent else "Jack (manuale)"
+                else:
+                    sender = getattr(entity, 'first_name', None) or "Lead"
+                messages.append({
+                    "sender": sender,
+                    "text": msg.text,
+                    "time": msg.date.strftime("%H:%M")
+                })
+
+        messages.reverse()
+        full_name = f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip()
+
+        return web.json_response({
+            "ok": True,
+            "chat_id": str(chat_id),
+            "nome": full_name,
+            "messaggi": messages
+        })
+
+    except Exception as e:
+        print(f"[GET-SINGLE-CHAT ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def handle_get_chats(request: web.Request) -> web.Response:
     """
     GET /get-chats?hours=8
@@ -622,6 +675,7 @@ async def start_http_server():
     app.router.add_post("/send-followup", handle_send_followup)
     app.router.add_get("/health",         handle_healthcheck)
     app.router.add_get("/get-chats",      handle_get_chats)
+    app.router.add_get("/get-single-chat", handle_get_single_chat)
     app.router.add_get("/folder-status",  handle_get_folder_status)
     app.router.add_post("/move-to-folder", handle_move_to_folder)
     runner = web.AppRunner(app)
