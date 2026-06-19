@@ -27,6 +27,7 @@ pending_messages = {}
 pending_tasks = {}
 paused_leads = set()
 agent_messages   = {}
+folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 def is_night_time():
     """Controlla se è notte in Italia (00:00 - 08:00)"""
     now = datetime.now(ITALY_TZ)
@@ -525,41 +526,44 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
         if not target_folder_name:
             return web.json_response({"ok": False, "error": "folder_name mancante"}, status=400)
 
-        entity = await client.get_entity(chat_id)
-        input_peer = await client.get_input_entity(entity)
+        # Lock per evitare che chiamate simultanee leggano filtri non aggiornati (race condition)
+        async with folder_lock:
+            entity = await client.get_entity(chat_id)
+            input_peer = await client.get_input_entity(entity)
 
-        filters = await get_dialog_filters()
+            filters = await get_dialog_filters()
 
-        # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Support che sono manuali)
-        AUTO_MANAGED_FOLDERS = ["Trattativa", "Contattare", "Perso"]
+            # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Support che sono manuali)
+            AUTO_MANAGED_FOLDERS = ["Trattativa", "Contattare", "Perso"]
 
-        target_filter = None
-        for f in filters:
-            if not (hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers')):
-                continue
+            target_filter = None
+            for f in filters:
+                if not (hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers')):
+                    continue
 
-            folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
-            folder_title = folder_title.strip()
+                folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
+                folder_title = folder_title.strip()
 
-            # Rimuovi la chat da tutte le cartelle auto-gestite (tranne quella target)
-            if folder_title in AUTO_MANAGED_FOLDERS and folder_title != target_folder_name:
-                new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
-                if len(new_peers) != len(f.include_peers):
-                    f.include_peers = new_peers
-                    await client(UpdateDialogFilterRequest(id=f.id, filter=f))
+                # Rimuovi la chat da tutte le cartelle auto-gestite (tranne quella target)
+                if folder_title in AUTO_MANAGED_FOLDERS and folder_title != target_folder_name:
+                    new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
+                    if len(new_peers) != len(f.include_peers):
+                        f.include_peers = new_peers
+                        await client(UpdateDialogFilterRequest(id=f.id, filter=f))
 
-            if folder_title == target_folder_name:
-                target_filter = f
+                if folder_title == target_folder_name:
+                    target_filter = f
 
-        if target_filter is None:
-            return web.json_response({"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}, status=404)
+            if target_filter is None:
+                return web.json_response({"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}, status=404)
 
-        already_in = any(getattr(p, 'user_id', None) == chat_id for p in target_filter.include_peers)
-        if not already_in:
-            target_filter.include_peers.append(input_peer)
-            await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
+            already_in = any(getattr(p, 'user_id', None) == chat_id for p in target_filter.include_peers)
+            if not already_in:
+                target_filter.include_peers.append(input_peer)
+                await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
 
-        return web.json_response({"ok": True, "moved_to": target_folder_name})
+            print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}'")
+            return web.json_response({"ok": True, "moved_to": target_folder_name})
 
     except Exception as e:
         print(f"[MOVE-FOLDER ERROR] {e}")
@@ -585,7 +589,7 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
         chat_agent_msgs = agent_messages.get(chat_id, [])
 
         messages = []
-        async for msg in client.iter_messages(entity, limit=10):
+        async for msg in client.iter_messages(entity, limit=5):
             if not msg.date or msg.date.timestamp() < cutoff:
                 break
             if msg.text:
