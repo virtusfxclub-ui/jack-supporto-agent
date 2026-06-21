@@ -601,7 +601,8 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
                 messages.append({
                     "sender": sender,
                     "text": msg.text,
-                    "time": msg.date.strftime("%H:%M")
+                    "time": msg.date.strftime("%H:%M"),
+                    "timestamp_iso": msg.date.isoformat()
                 })
 
         messages.reverse()
