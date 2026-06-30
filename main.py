@@ -513,8 +513,11 @@ async def handle_get_folder_status(request: web.Request) -> web.Response:
 async def handle_move_to_folder(request: web.Request) -> web.Response:
     """
     POST /move-to-folder
-    Body: {"chat_id": "123456", "folder_name": "Trattativa"}
-    Sposta una chat nella cartella specificata (la rimuove dalle altre cartelle auto-gestite)
+    Body: {"chat_id": "123456", "folder_name": "Trattativa", "exclusive": false}
+    Sposta una chat nella cartella specificata.
+    Se exclusive=true, rimuove la chat da TUTTE le altre cartelle gestite (usato per VIP).
+    Se exclusive=false (default), rimuove solo dalle cartelle auto-gestite (Trattativa/Contattare/Perso),
+    permettendo a una chat di stare in più cartelle manuali contemporaneamente (es. Attesa + Transfer).
     """
     try:
         from telethon.tl.functions.messages import UpdateDialogFilterRequest
@@ -522,6 +525,7 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
         data = await request.json()
         chat_id = int(data.get("chat_id"))
         target_folder_name = data.get("folder_name", "").strip()
+        exclusive = bool(data.get("exclusive", False))
 
         if not target_folder_name:
             return web.json_response({"ok": False, "error": "folder_name mancante"}, status=400)
@@ -533,7 +537,7 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
 
             filters = await get_dialog_filters()
 
-            # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Support che sono manuali)
+            # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Attesa, Support che sono manuali)
             AUTO_MANAGED_FOLDERS = ["Trattativa", "Contattare", "Perso"]
 
             target_filter = None
@@ -544,8 +548,16 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
                 folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
                 folder_title = folder_title.strip()
 
-                # Rimuovi la chat da tutte le cartelle auto-gestite (tranne quella target)
-                if folder_title in AUTO_MANAGED_FOLDERS and folder_title != target_folder_name:
+                should_remove = False
+                if folder_title != target_folder_name:
+                    if exclusive:
+                        # Modalita' esclusiva: rimuovi da QUALSIASI altra cartella (usato per VIP)
+                        should_remove = True
+                    elif folder_title in AUTO_MANAGED_FOLDERS:
+                        # Modalita' normale: rimuovi solo dalle cartelle auto-gestite
+                        should_remove = True
+
+                if should_remove:
                     new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
                     if len(new_peers) != len(f.include_peers):
                         f.include_peers = new_peers
@@ -562,7 +574,7 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
                 target_filter.include_peers.append(input_peer)
                 await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
 
-            print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}'")
+            print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}' (exclusive={exclusive})")
             return web.json_response({"ok": True, "moved_to": target_folder_name})
 
     except Exception as e:
