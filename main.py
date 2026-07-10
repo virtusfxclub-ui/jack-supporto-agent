@@ -247,18 +247,21 @@ async def process_messages(sender_id, sender_info, debounce):
                     clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
 
                     # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
+                    AUDIO_KEY_MAP = {
+                        "AUDIO_1": "audio1_rapport",
+                        "AUDIO_2": "audio2_valore_meta",
+                        "AUDIO_3": "audio3_pre_registrazione",
+                        "AUDIO_4": "audio4_rassicurazione_obiezione",
+                    }
                     audio_key_to_send = None
                     for key in ["AUDIO_1", "AUDIO_2", "AUDIO_3", "AUDIO_4"]:
                         marker = f"[{key}]"
-                        if marker in clean_reply:
-                            audio_key_to_send = {
-                                "AUDIO_1": "audio1_rapport",
-                                "AUDIO_2": "audio2_valore_meta",
-                                "AUDIO_3": "audio3_pre_registrazione",
-                                "AUDIO_4": "audio4_rassicurazione_obiezione",
-                            }[key]
-                            clean_reply = clean_reply.replace(marker, "").strip()
-                            break  # solo un audio per messaggio, come da regola nel prompt
+                        if marker in clean_reply and audio_key_to_send is None:
+                            # Manda solo il primo audio trovato (un solo audio per messaggio)
+                            audio_key_to_send = AUDIO_KEY_MAP[key]
+                        # Rimuove SEMPRE il marker dal testo visibile, anche se non e' il primo,
+                        # cosi' non resta mai scritto un flag letterale tipo "[AUDIO_2]" nel messaggio
+                        clean_reply = clean_reply.replace(marker, "").strip()
 
                     await send_split_messages(sender_id, clean_reply)
                     print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
