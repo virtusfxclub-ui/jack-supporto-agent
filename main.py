@@ -28,6 +28,14 @@ pending_tasks = {}
 paused_leads = set()
 agent_messages   = {}
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
+
+# Libreria audio — nome chiave (usato nei flag [AUDIO_1]..[AUDIO_4]) -> URL raw GitHub
+AUDIO_LIBRARY = {
+    "audio1_rapport": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio1_rapport.ogg",
+    "audio2_valore_meta": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio2_valore_meta.ogg",
+    "audio3_pre_registrazione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio3_pre_registrazione.ogg",
+    "audio4_rassicurazione_obiezione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio4_rassicurazione_obiezione.ogg",
+}
 def is_night_time():
     """Controlla se è notte in Italia (00:00 - 08:00)"""
     now = datetime.now(ITALY_TZ)
@@ -237,8 +245,46 @@ async def process_messages(sender_id, sender_info, debounce):
                     # Gestione STORICO_LEAD — manda risposta rapida /STORICO
                     should_send_storico = '[STORICO_LEAD]' in reply_text
                     clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
+
+                    # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
+                    audio_key_to_send = None
+                    for key in ["AUDIO_1", "AUDIO_2", "AUDIO_3", "AUDIO_4"]:
+                        marker = f"[{key}]"
+                        if marker in clean_reply:
+                            audio_key_to_send = {
+                                "AUDIO_1": "audio1_rapport",
+                                "AUDIO_2": "audio2_valore_meta",
+                                "AUDIO_3": "audio3_pre_registrazione",
+                                "AUDIO_4": "audio4_rassicurazione_obiezione",
+                            }[key]
+                            clean_reply = clean_reply.replace(marker, "").strip()
+                            break  # solo un audio per messaggio, come da regola nel prompt
+
                     await send_split_messages(sender_id, clean_reply)
                     print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
+
+                    if audio_key_to_send:
+                        await asyncio.sleep(1.5)
+                        try:
+                            audio_url = AUDIO_LIBRARY.get(audio_key_to_send)
+                            if audio_url:
+                                async with aiohttp.ClientSession() as audio_session:
+                                    async with audio_session.get(audio_url) as audio_resp:
+                                        if audio_resp.status == 200:
+                                            audio_bytes = await audio_resp.read()
+                                            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+                                                tmp_file.write(audio_bytes)
+                                                tmp_path = tmp_file.name
+                                            try:
+                                                await client.send_file(sender_id, tmp_path, voice_note=True)
+                                                print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']}")
+                                            finally:
+                                                os.remove(tmp_path)
+                                        else:
+                                            print(f"[AUDIO ERROR] Download fallito status {audio_resp.status}")
+                        except Exception as e:
+                            print(f"[AUDIO ERROR] {e}")
+
                     if should_send_storico:
                         await asyncio.sleep(2)
                         try:
@@ -450,6 +496,52 @@ async def handle_send_followup(request: web.Request) -> web.Response:
     except Exception as e:
         print(f"[HTTP ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+async def handle_send_audio(request: web.Request) -> web.Response:
+    """
+    POST /send-audio
+    Body: {"chat_id": "123456", "audio_key": "audio1_rapport"}
+    Scarica l'audio da GitHub (raw) e lo invia come vocale nativo Telegram (voice_note=True).
+    audio_key deve essere una delle chiavi in AUDIO_LIBRARY.
+    """
+    try:
+        body = await request.json()
+        chat_id = body.get("chat_id") or body.get("chatId")
+        audio_key = body.get("audio_key") or body.get("audioKey")
+
+        if not chat_id or not audio_key:
+            return web.json_response({"ok": False, "error": "chat_id e audio_key obbligatori"}, status=400)
+
+        if audio_key not in AUDIO_LIBRARY:
+            return web.json_response({"ok": False, "error": f"audio_key '{audio_key}' non riconosciuto. Validi: {list(AUDIO_LIBRARY.keys())}"}, status=400)
+
+        chat_id = int(chat_id)
+        audio_url = AUDIO_LIBRARY[audio_key]
+
+        print(f"[AUDIO] Scarico {audio_key} per invio a {chat_id}")
+
+        # Scarica il file audio in una cartella temporanea
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio_url) as resp:
+                if resp.status != 200:
+                    return web.json_response({"ok": False, "error": f"Download audio fallito, status {resp.status}"}, status=502)
+                audio_bytes = await resp.read()
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_path = tmp_file.name
+
+        try:
+            await client.send_file(chat_id, tmp_path, voice_note=True)
+            print(f"[AUDIO] Inviato {audio_key} a {chat_id}")
+        finally:
+            os.remove(tmp_path)
+
+        return web.json_response({"ok": True, "audio_key": audio_key})
+    except Exception as e:
+        print(f"[HTTP ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
 async def handle_healthcheck(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "service": "jack-supporto-agent"})
 async def get_dialog_filters():
@@ -690,6 +782,7 @@ async def handle_get_chats(request: web.Request) -> web.Response:
 async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
+    app.router.add_post("/send-audio",    handle_send_audio)
     app.router.add_get("/health",         handle_healthcheck)
     app.router.add_get("/get-chats",      handle_get_chats)
     app.router.add_get("/get-single-chat", handle_get_single_chat)
