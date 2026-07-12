@@ -679,9 +679,11 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
 
 async def handle_get_single_chat(request: web.Request) -> web.Response:
     """
-    GET /get-single-chat?chat_id=123456&hours=72
+    GET /get-single-chat?chat_id=123456&hours=72&limit=5
     Restituisce SOLO la chat specificata, senza scansionare tutti i dialoghi.
     Molto più veloce di /get-chats quando serve una sola chat.
+    Parametro 'limit' opzionale (default 5, invariato per retrocompatibilità col sistema cartelle/follow-up).
+    Il workflow principale (routing Agent1/Agent2) passa un limit più alto (es. 200) per avere lo storico completo.
     """
     try:
         chat_id_str = request.rel_url.query.get("chat_id", "")
@@ -690,13 +692,14 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
 
         chat_id = int(chat_id_str)
         hours = int(request.rel_url.query.get("hours", "72"))
+        limit = int(request.rel_url.query.get("limit", "5"))
         cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
 
         entity = await client.get_entity(chat_id)
         chat_agent_msgs = agent_messages.get(chat_id, [])
 
         messages = []
-        async for msg in client.iter_messages(entity, limit=5):
+        async for msg in client.iter_messages(entity, limit=limit):
             if not msg.date or msg.date.timestamp() < cutoff:
                 break
             if msg.text:
