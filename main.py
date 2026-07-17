@@ -242,8 +242,11 @@ async def process_messages(sender_id, sender_info, debounce):
                         paused_leads.add(sender_id)
                         print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
                         return
-                    # Gestione STORICO_LEAD — manda risposta rapida /STORICO
-                    should_send_storico = '[STORICO_LEAD]' in reply_text
+                    # STORICO PDF — DISATTIVATO. Il documento non va mai inviato a nessuno.
+                    # Il marker viene comunque ripulito dal testo come rete di sicurezza,
+                    # cosi' se il modello lo scrivesse per errore non finisce visibile al lead.
+                    if '[STORICO_LEAD]' in reply_text:
+                        print(f"[STORICO] Flag ignorato (invio PDF disattivato) — chat {sender_id}")
                     clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
 
                     # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
@@ -288,22 +291,6 @@ async def process_messages(sender_id, sender_info, debounce):
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
 
-                    if should_send_storico:
-                        await asyncio.sleep(2)
-                        try:
-                            import os
-                            pdf_path = "/app/storico.pdf"
-                            if os.path.exists(pdf_path):
-                                await client.send_file(
-                                    sender_id,
-                                    pdf_path,
-                                    caption="Virtus FX Club — Performance Report Dic 2025 / Mag 2026"
-                                )
-                                print(f"[STORICO] PDF inviato a {sender_info['full_name']}")
-                            else:
-                                print(f"[STORICO] PDF non trovato in {pdf_path}")
-                        except Exception as e:
-                            print(f"[STORICO ERROR] {e}")
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
     except Exception as e:
