@@ -29,12 +29,11 @@ paused_leads = set()
 agent_messages   = {}
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
-# Libreria audio — nome chiave (usato nei flag [AUDIO_1]..[AUDIO_4]) -> URL raw GitHub
+# Libreria audio — nome chiave (usato nei flag [AUDIO_1]..[AUDIO_3]) -> URL raw GitHub
 AUDIO_LIBRARY = {
-    "audio1_rapport": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio1_rapport.ogg",
-    "audio2_valore_meta": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio2_valore_meta.ogg",
-    "audio3_pre_registrazione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio3_pre_registrazione.ogg",
-    "audio4_rassicurazione_obiezione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio4_rassicurazione_obiezione.ogg",
+    "audio1_benvenuto": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio1_benvenuto.ogg",
+    "audio2_spiegazione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio2_spiegazione.ogg",
+    "audio3_scettico": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio3_scettico.ogg",
 }
 def is_night_time():
     """Controlla se è notte in Italia (00:00 - 08:00)"""
@@ -251,13 +250,12 @@ async def process_messages(sender_id, sender_info, debounce):
 
                     # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
                     AUDIO_KEY_MAP = {
-                        "AUDIO_1": "audio1_rapport",
-                        "AUDIO_2": "audio2_valore_meta",
-                        "AUDIO_3": "audio3_pre_registrazione",
-                        "AUDIO_4": "audio4_rassicurazione_obiezione",
+                        "AUDIO_1": "audio1_benvenuto",
+                        "AUDIO_2": "audio2_spiegazione",
+                        "AUDIO_3": "audio3_scettico",
                     }
                     audio_key_to_send = None
-                    for key in ["AUDIO_1", "AUDIO_2", "AUDIO_3", "AUDIO_4"]:
+                    for key in ["AUDIO_1", "AUDIO_2", "AUDIO_3"]:
                         marker = f"[{key}]"
                         if marker in clean_reply and audio_key_to_send is None:
                             # Manda solo il primo audio trovato (un solo audio per messaggio)
@@ -490,7 +488,7 @@ async def handle_send_followup(request: web.Request) -> web.Response:
 async def handle_send_audio(request: web.Request) -> web.Response:
     """
     POST /send-audio
-    Body: {"chat_id": "123456", "audio_key": "audio1_rapport"}
+    Body: {"chat_id": "123456", "audio_key": "audio1_benvenuto"}
     Scarica l'audio da GitHub (raw) e lo invia come vocale nativo Telegram (voice_note=True).
     audio_key deve essere una delle chiavi in AUDIO_LIBRARY.
     """
