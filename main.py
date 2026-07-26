@@ -268,7 +268,6 @@ async def process_messages(sender_id, sender_info, debounce):
                     print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
 
                     if audio_key_to_send:
-                        await asyncio.sleep(1.5)
                         try:
                             audio_url = AUDIO_LIBRARY.get(audio_key_to_send)
                             if audio_url:
@@ -276,12 +275,27 @@ async def process_messages(sender_id, sender_info, debounce):
                                     async with audio_session.get(audio_url) as audio_resp:
                                         if audio_resp.status == 200:
                                             audio_bytes = await audio_resp.read()
+
+                                            # Stima durata audio dai byte (Opus ~64kbps = ~8000 byte/sec)
+                                            # e calcola un delay di "registrazione" proporzionale ma contenuto.
+                                            est_seconds = len(audio_bytes) / 8000.0
+                                            # delay tra 3 e 8 secondi: circa un terzo della durata stimata, con tetti
+                                            record_delay = max(3.0, min(8.0, est_seconds * 0.33))
+
+                                            # Mostra "sta registrando un messaggio vocale..." durante l'attesa
+                                            try:
+                                                async with client.action(sender_id, 'record-audio'):
+                                                    await asyncio.sleep(record_delay)
+                                            except Exception:
+                                                # Se l'indicatore non è disponibile, aspetta comunque
+                                                await asyncio.sleep(record_delay)
+
                                             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
                                                 tmp_file.write(audio_bytes)
                                                 tmp_path = tmp_file.name
                                             try:
                                                 await client.send_file(sender_id, tmp_path, voice_note=True)
-                                                print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']}")
+                                                print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']} (delay {record_delay:.1f}s)")
                                             finally:
                                                 os.remove(tmp_path)
                                         else:
@@ -334,6 +348,12 @@ async def handle_incoming(event):
         message_text = event.message.message or ""
         media_type = "text"
         debounce = DEBOUNCE_TEXT
+
+        # Segna il messaggio del lead come letto → il lead vede le spunte blu (comportamento umano)
+        try:
+            await client.send_read_acknowledge(sender_id, event.message)
+        except Exception as e:
+            print(f"[READ] Impossibile segnare come letto {sender_id}: {e}")
         if event.message.media:
             if isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
