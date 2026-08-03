@@ -354,6 +354,20 @@ async def handle_incoming(event):
             await client.send_read_acknowledge(sender_id, event.message)
         except Exception as e:
             print(f"[READ] Impossibile segnare come letto {sender_id}: {e}")
+
+        # Notifica sul bot di controllo: serve perché il read receipt sopra sopprime
+        # la notifica push nativa di Telegram sugli altri dispositivi di Jack.
+        try:
+            anteprima = message_text.strip() if message_text.strip() else "[media]"
+            if len(anteprima) > 200:
+                anteprima = anteprima[:200] + "..."
+            username_txt = f" (@{sender_username})" if sender_username else ""
+            asyncio.create_task(notify_jack(
+                f"💬 {full_name}{username_txt}\n"
+                f"{anteprima}"
+            ))
+        except Exception as e:
+            print(f"[NOTIFY] Errore notifica nuovo messaggio: {e}")
         if event.message.media:
             if isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
