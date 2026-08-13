@@ -29,6 +29,11 @@ paused_leads = set()
 agent_messages   = {}
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
+# Traccia i vocali inviati per chat: {chat_id: {message_id: audio_key}}
+# Serve perche' i vocali non hanno testo e senza questo non comparirebbero nello storico
+# letto dall'agent, che finirebbe per rimandare lo stesso audio due volte.
+sent_audios = {}
+
 # Libreria audio — nome chiave (usato nei flag [AUDIO_1]..[AUDIO_3]) -> URL raw GitHub
 AUDIO_LIBRARY = {
     "audio1_benvenuto": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio1_benvenuto.ogg",
@@ -294,7 +299,13 @@ async def process_messages(sender_id, sender_info, debounce):
                                                 tmp_file.write(audio_bytes)
                                                 tmp_path = tmp_file.name
                                             try:
-                                                await client.send_file(sender_id, tmp_path, voice_note=True)
+                                                sent_msg = await client.send_file(sender_id, tmp_path, voice_note=True)
+                                                # registra quale audio e' stato mandato, per renderlo visibile nello storico
+                                                try:
+                                                    if sent_msg is not None:
+                                                        sent_audios.setdefault(sender_id, {})[sent_msg.id] = audio_key_to_send
+                                                except Exception:
+                                                    pass
                                                 print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']} (delay {record_delay:.1f}s)")
                                             finally:
                                                 os.remove(tmp_path)
@@ -554,7 +565,12 @@ async def handle_send_audio(request: web.Request) -> web.Response:
             tmp_path = tmp_file.name
 
         try:
-            await client.send_file(chat_id, tmp_path, voice_note=True)
+            sent_msg = await client.send_file(chat_id, tmp_path, voice_note=True)
+            try:
+                if sent_msg is not None:
+                    sent_audios.setdefault(chat_id, {})[sent_msg.id] = audio_key
+            except Exception:
+                pass
             print(f"[AUDIO] Inviato {audio_key} a {chat_id}")
         finally:
             os.remove(tmp_path)
@@ -717,10 +733,13 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
         entity = await client.get_entity(chat_id)
         chat_agent_msgs = agent_messages.get(chat_id, [])
 
+        chat_sent_audios = sent_audios.get(chat_id, {})
+
         messages = []
         async for msg in client.iter_messages(entity, limit=limit):
             if not msg.date or msg.date.timestamp() < cutoff:
                 break
+
             if msg.text:
                 if msg.out:
                     is_agent = msg.text.strip() in chat_agent_msgs
@@ -730,6 +749,19 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
                 messages.append({
                     "sender": sender,
                     "text": msg.text,
+                    "time": msg.date.strftime("%H:%M"),
+                    "timestamp_iso": msg.date.isoformat()
+                })
+                continue
+
+            # Vocali: non hanno testo, ma DEVONO comparire nello storico.
+            # Senza questo l'agent non sa di aver gia' mandato un audio e lo rimanda.
+            if getattr(msg, 'voice', None) and msg.out:
+                audio_key = chat_sent_audios.get(msg.id)
+                etichetta = f"[VOCALE GIA' INVIATO: {audio_key}]" if audio_key else "[VOCALE GIA' INVIATO]"
+                messages.append({
+                    "sender": "Agent",
+                    "text": etichetta,
                     "time": msg.date.strftime("%H:%M"),
                     "timestamp_iso": msg.date.isoformat()
                 })
