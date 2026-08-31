@@ -40,6 +40,29 @@ AUDIO_LIBRARY = {
     "audio2_spiegazione": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio2_spiegazione.ogg",
     "audio3_scettico": "https://raw.githubusercontent.com/virtusfxclub-ui/jack-supporto-agent/main/audio/audio3_scettico.ogg",
 }
+
+
+async def carica_audio_bytes(audio_key: str):
+    """Scarica l'audio dal repo GitHub. Il repo deve essere pubblico."""
+    url = AUDIO_LIBRARY.get(audio_key)
+    if not url:
+        print(f"[AUDIO] Chiave sconosciuta: {audio_key}")
+        return None
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                if resp.status == 404:
+                    print(f"[AUDIO] 404 su {audio_key}: verifica che il repo GitHub sia PUBBLICO "
+                          f"e che il file esista in audio/")
+                else:
+                    print(f"[AUDIO] Download fallito ({resp.status}) per {audio_key}")
+    except Exception as e:
+        print(f"[AUDIO] Errore download {audio_key}: {e}")
+    return None
+
+
 def is_night_time():
     """Controlla se è notte in Italia (00:00 - 08:00)"""
     now = datetime.now(ITALY_TZ)
@@ -59,9 +82,9 @@ def get_night_bridge_message(first_name: str, context_hint: str = "") -> str:
     else:
         action = "ti rispondo"
     if 0 <= hour < 3:
-        return f"Guarda {name}, sto andando a letto adesso. Domattina ti scrivo io personalmente e {action}, ok?"
+        return f"Guarda {name}, sto andando a letto adesso. Ti scrivo direttamente quando sono in ufficio e {action}, ok?"
     else:
-        return f"Guarda {name}, domattina appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
+        return f"Guarda {name}, appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
 async def get_chat_history(sender_id: int) -> str:
     """Carica la cronologia della chat esistente da Telethon"""
     try:
@@ -274,43 +297,38 @@ async def process_messages(sender_id, sender_info, debounce):
 
                     if audio_key_to_send:
                         try:
-                            audio_url = AUDIO_LIBRARY.get(audio_key_to_send)
-                            if audio_url:
-                                async with aiohttp.ClientSession() as audio_session:
-                                    async with audio_session.get(audio_url) as audio_resp:
-                                        if audio_resp.status == 200:
-                                            audio_bytes = await audio_resp.read()
+                            audio_bytes = await carica_audio_bytes(audio_key_to_send)
+                            if not audio_bytes:
+                                print(f"[AUDIO ERROR] {audio_key_to_send} non disponibile, messaggio inviato senza vocale")
+                            else:
+                                # Stima durata audio dai byte (Opus ~64kbps = ~8000 byte/sec)
+                                # e calcola un delay di "registrazione" proporzionale ma contenuto.
+                                est_seconds = len(audio_bytes) / 8000.0
+                                # delay tra 3 e 8 secondi: circa un terzo della durata stimata, con tetti
+                                record_delay = max(3.0, min(8.0, est_seconds * 0.33))
 
-                                            # Stima durata audio dai byte (Opus ~64kbps = ~8000 byte/sec)
-                                            # e calcola un delay di "registrazione" proporzionale ma contenuto.
-                                            est_seconds = len(audio_bytes) / 8000.0
-                                            # delay tra 3 e 8 secondi: circa un terzo della durata stimata, con tetti
-                                            record_delay = max(3.0, min(8.0, est_seconds * 0.33))
+                                # Mostra "sta registrando un messaggio vocale..." durante l'attesa
+                                try:
+                                    async with client.action(sender_id, 'record-audio'):
+                                        await asyncio.sleep(record_delay)
+                                except Exception:
+                                    # Se l'indicatore non è disponibile, aspetta comunque
+                                    await asyncio.sleep(record_delay)
 
-                                            # Mostra "sta registrando un messaggio vocale..." durante l'attesa
-                                            try:
-                                                async with client.action(sender_id, 'record-audio'):
-                                                    await asyncio.sleep(record_delay)
-                                            except Exception:
-                                                # Se l'indicatore non è disponibile, aspetta comunque
-                                                await asyncio.sleep(record_delay)
-
-                                            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
-                                                tmp_file.write(audio_bytes)
-                                                tmp_path = tmp_file.name
-                                            try:
-                                                sent_msg = await client.send_file(sender_id, tmp_path, voice_note=True)
-                                                # registra quale audio e' stato mandato, per renderlo visibile nello storico
-                                                try:
-                                                    if sent_msg is not None:
-                                                        sent_audios.setdefault(sender_id, {})[sent_msg.id] = audio_key_to_send
-                                                except Exception:
-                                                    pass
-                                                print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']} (delay {record_delay:.1f}s)")
-                                            finally:
-                                                os.remove(tmp_path)
-                                        else:
-                                            print(f"[AUDIO ERROR] Download fallito status {audio_resp.status}")
+                                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+                                    tmp_file.write(audio_bytes)
+                                    tmp_path = tmp_file.name
+                                try:
+                                    sent_msg = await client.send_file(sender_id, tmp_path, voice_note=True)
+                                    # registra quale audio e' stato mandato, per renderlo visibile nello storico
+                                    try:
+                                        if sent_msg is not None:
+                                            sent_audios.setdefault(sender_id, {})[sent_msg.id] = audio_key_to_send
+                                    except Exception:
+                                        pass
+                                    print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']} (delay {record_delay:.1f}s)")
+                                finally:
+                                    os.remove(tmp_path)
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
 
@@ -549,16 +567,12 @@ async def handle_send_audio(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "error": f"audio_key '{audio_key}' non riconosciuto. Validi: {list(AUDIO_LIBRARY.keys())}"}, status=400)
 
         chat_id = int(chat_id)
-        audio_url = AUDIO_LIBRARY[audio_key]
 
-        print(f"[AUDIO] Scarico {audio_key} per invio a {chat_id}")
+        print(f"[AUDIO] Preparo {audio_key} per invio a {chat_id}")
 
-        # Scarica il file audio in una cartella temporanea
-        async with aiohttp.ClientSession() as session:
-            async with session.get(audio_url) as resp:
-                if resp.status != 200:
-                    return web.json_response({"ok": False, "error": f"Download audio fallito, status {resp.status}"}, status=502)
-                audio_bytes = await resp.read()
+        audio_bytes = await carica_audio_bytes(audio_key)
+        if not audio_bytes:
+            return web.json_response({"ok": False, "error": f"Audio '{audio_key}' non trovato ne' su disco ne' su GitHub"}, status=502)
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
             tmp_file.write(audio_bytes)
