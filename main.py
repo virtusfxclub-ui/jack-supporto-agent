@@ -155,10 +155,27 @@ async def notify_jack(text: str, topic: str = "alert"):
         payload["message_thread_id"] = thread_id
     try:
         async with aiohttp.ClientSession() as session:
-            await session.post(
+            async with session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json=payload
-            )
+            ) as resp:
+                # Telegram risponde 200 con ok:false quando la chat non esiste o il topic
+                # e' sbagliato: senza questo controllo l'errore passava inosservato.
+                body = await resp.json()
+                if not body.get("ok"):
+                    print(f"[NOTIFY FAIL] topic={topic} chat_id={CONTROL_CHAT_ID} "
+                          f"thread={thread_id} -> {body.get('description')}")
+                    # Ritenta senza topic: se il gruppo non ha i Topic attivi
+                    # o l'id del thread e' sbagliato, almeno il messaggio arriva.
+                    if thread_id:
+                        payload.pop("message_thread_id", None)
+                        async with session.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json=payload
+                        ) as resp2:
+                            body2 = await resp2.json()
+                            if not body2.get("ok"):
+                                print(f"[NOTIFY FAIL 2] {body2.get('description')}")
     except Exception as e:
         print(f"[NOTIFY ERROR] {e}")
 async def transcribe_audio(file_path: str, content_type: str = "audio/ogg", filename: str = "audio.ogg") -> str:
