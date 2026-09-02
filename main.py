@@ -626,12 +626,23 @@ async def handle_rename_contact(request: web.Request) -> web.Response:
         nuovo_first = pulisci(first)
         nuovo_last = pulisci(last)
 
-        # Il pallino va in coda: sul cognome se c'e', altrimenti sul nome
+        # Il pallino va messo PRIMA della parola "VIP" se c'e' (cosi' resta ben visibile
+        # anche quando il nome e' lungo), altrimenti in coda.
         if pallino:
-            if nuovo_last:
+            import re
+            pattern = re.compile(r'\bvip\b', re.IGNORECASE)
+
+            if pattern.search(nuovo_last):
+                nuovo_last = pattern.sub(lambda m: f"{pallino} {m.group(0)}", nuovo_last, count=1)
+            elif pattern.search(nuovo_first):
+                nuovo_first = pattern.sub(lambda m: f"{pallino} {m.group(0)}", nuovo_first, count=1)
+            elif nuovo_last:
                 nuovo_last = f"{nuovo_last} {pallino}"
             else:
                 nuovo_first = f"{nuovo_first} {pallino}"
+
+            nuovo_first = ' '.join(nuovo_first.split())
+            nuovo_last = ' '.join(nuovo_last.split())
 
         await client(AddContactRequest(
             id=entity,
@@ -773,7 +784,10 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
         target_folder_name = data.get("folder_name", "").strip()
         exclusive = bool(data.get("exclusive", False))
 
-        if not target_folder_name:
+        # folder_name vuoto + exclusive=true significa: rimuovi da TUTTE le cartelle
+        # (usato per i VIP senza pallino, che non devono stare da nessuna parte)
+        solo_rimozione = (target_folder_name == "")
+        if not target_folder_name and not exclusive:
             return web.json_response({"ok": False, "error": "folder_name mancante"}, status=400)
 
         # Lock per evitare che chiamate simultanee leggano filtri non aggiornati (race condition)
@@ -817,6 +831,10 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
 
                 if is_target:
                     target_filter = f
+
+            if solo_rimozione:
+                print(f"[FOLDER] Chat {chat_id} rimossa da tutte le cartelle")
+                return web.json_response({"ok": True, "rimosso_da_tutte": True})
 
             if target_filter is None:
                 return web.json_response({"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}, status=404)
