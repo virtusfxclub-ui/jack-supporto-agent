@@ -11,7 +11,11 @@ from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
-CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-5137754911"))
+CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-1003808377504"))
+# Topic del gruppo di controllo: il flusso normale va in "chat", le cose che
+# richiedono un'azione di Jack vanno in "alert" (che lui tiene con le notifiche accese).
+TOPIC_CHAT = int(os.environ.get("TOPIC_CHAT", "2"))
+TOPIC_ALERT = int(os.environ.get("TOPIC_ALERT", "4"))
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
@@ -81,10 +85,12 @@ def get_night_bridge_message(first_name: str, context_hint: str = "") -> str:
         action = "ti scrivo"
     else:
         action = "ti rispondo"
+    # NIENTE nome qui: il main conosce solo il nome del profilo Telegram (spesso un
+    # nickname o un brand tipo "Trading LM"), non quello dichiarato dal lead in chat.
     if 0 <= hour < 3:
-        return f"Guarda {name}, sto andando a letto adesso. Ti scrivo direttamente quando sono in ufficio e {action}, ok?"
+        return f"Guarda, sto andando a letto adesso. Ti scrivo direttamente quando sono in ufficio e {action}, ok?"
     else:
-        return f"Guarda {name}, appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
+        return f"Guarda, appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
 async def get_chat_history(sender_id: int) -> str:
     """Carica la cronologia della chat esistente da Telethon"""
     try:
@@ -126,12 +132,32 @@ async def update_airtable_vip(chat_id: str):
                                 print(f"[AIRTABLE ERROR] Status: {patch_resp.status}")
     except Exception as e:
         print(f"[AIRTABLE VIP ERROR] {e}")
-async def notify_jack(text: str):
+def _norm_folder(nome: str) -> str:
+    """
+    Normalizza un nome cartella per il confronto: toglie emoji, spazi e maiuscole.
+    Serve perche' le cartelle su Telegram hanno il pallino nel nome ("VIP 🟢")
+    ma nel codice le referenziamo come "VIP".
+    """
+    if not nome:
+        return ""
+    return "".join(ch for ch in nome.lower() if ch.isalnum())
+
+
+async def notify_jack(text: str, topic: str = "alert"):
+    """
+    Manda una notifica nel gruppo di controllo.
+    topic="chat"  -> flusso normale (messaggi in arrivo), si puo' silenziare
+    topic="alert" -> richiede un'azione di Jack, notifiche accese
+    """
+    thread_id = TOPIC_CHAT if topic == "chat" else TOPIC_ALERT
+    payload = {"chat_id": CONTROL_CHAT_ID, "text": text}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": CONTROL_CHAT_ID, "text": text}
+                json=payload
             )
     except Exception as e:
         print(f"[NOTIFY ERROR] {e}")
@@ -276,6 +302,18 @@ async def process_messages(sender_id, sender_info, debounce):
                         print(f"[STORICO] Flag ignorato (invio PDF disattivato) — chat {sender_id}")
                     clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
 
+                    # Alert dedicato: serve la procedura di chiusura conto AXI
+                    if '[ALERT_CHIUSURA]' in clean_reply:
+                        clean_reply = clean_reply.replace('[ALERT_CHIUSURA]', '').strip()
+                        asyncio.create_task(notify_jack(
+                            f"🟠 CHIUSURA CONTO AXI\n\n"
+                            f"👤 {sender_info['full_name']}\n"
+                            f"📱 ID: {sender_id}\n\n"
+                            f"Ha già un conto AXI con deposito: serve mandargli la mail "
+                            f"e il documento con la procedura di chiusura e riapertura.",
+                            topic="alert"
+                        ))
+
                     # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
                     AUDIO_KEY_MAP = {
                         "AUDIO_1": "audio1_benvenuto",
@@ -371,7 +409,9 @@ async def handle_incoming(event):
                 f"⏸ LEAD IN PAUSA HA SCRITTO\n\n"
                 f"👤 {full_name} (@{sender_username})\n"
                 f"💬 Ha scritto: {event.message.message or '[media]'}\n\n"
-                f"Scrivi 'riprendi {sender_id}' per riattivare l'agent."
+                f"Per riattivare l'agent copia e invia questo comando:\n"
+                f"riprendi {sender_id}",
+                topic="alert"
             )
             return
         message_text = event.message.message or ""
@@ -393,7 +433,8 @@ async def handle_incoming(event):
             username_txt = f" (@{sender_username})" if sender_username else ""
             asyncio.create_task(notify_jack(
                 f"💬 {full_name}{username_txt}\n"
-                f"{anteprima}"
+                f"{anteprima}",
+                topic="chat"
             ))
         except Exception as e:
             print(f"[NOTIFY] Errore notifica nuovo messaggio: {e}")
@@ -407,7 +448,9 @@ async def handle_incoming(event):
                     f"👤 {full_name} (@{sender_username})\n"
                     f"📱 ID: {sender_id}\n\n"
                     f"Vai nella chat e rispondi tu direttamente.\n"
-                    f"Scrivi 'riprendi {sender_id}' quando vuoi che riprenda l'agent."
+                    f"Per riattivare l'agent copia e invia:\n"
+                    f"riprendi {sender_id}",
+                    topic="alert"
                 )
                 return
             elif isinstance(event.message.media, MessageMediaDocument):
@@ -548,6 +591,65 @@ async def handle_send_followup(request: web.Request) -> web.Response:
         print(f"[HTTP ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+PALLINI = ["\U0001F7E1", "\U0001F7E2", "\U0001F7E0", "\U0001F534"]  # giallo, verde, arancione, rosso
+
+async def handle_rename_contact(request: web.Request) -> web.Response:
+    """
+    POST /rename-contact
+    Body: {"chat_id": "123", "pallino": "🟠"}
+    Cambia SOLO il pallino nel nome del contatto, lasciando intatto il resto.
+    "Giorgia D. VIP 🟡" -> "Giorgia D. VIP 🟠"
+    Se il contatto non ha pallino, lo aggiunge in coda.
+    Passare pallino vuoto rimuove il pallino senza aggiungerne uno.
+    """
+    try:
+        from telethon.tl.functions.contacts import AddContactRequest
+
+        data = await request.json()
+        chat_id = int(data.get("chat_id"))
+        pallino = (data.get("pallino") or "").strip()
+
+        if pallino and pallino not in PALLINI:
+            return web.json_response(
+                {"ok": False, "error": f"Pallino non valido. Ammessi: {PALLINI}"}, status=400)
+
+        entity = await client.get_entity(chat_id)
+        first = getattr(entity, 'first_name', '') or ''
+        last = getattr(entity, 'last_name', '') or ''
+
+        # Rimuove eventuali pallini esistenti, preservando tutto il resto del nome
+        def pulisci(s):
+            for p in PALLINI:
+                s = s.replace(p, '')
+            return ' '.join(s.split())
+
+        nuovo_first = pulisci(first)
+        nuovo_last = pulisci(last)
+
+        # Il pallino va in coda: sul cognome se c'e', altrimenti sul nome
+        if pallino:
+            if nuovo_last:
+                nuovo_last = f"{nuovo_last} {pallino}"
+            else:
+                nuovo_first = f"{nuovo_first} {pallino}"
+
+        await client(AddContactRequest(
+            id=entity,
+            first_name=nuovo_first[:64],
+            last_name=nuovo_last[:64],
+            phone="",
+            add_phone_privacy_exception=False
+        ))
+
+        nome_finale = f"{nuovo_first} {nuovo_last}".strip()
+        print(f"[RENAME] {chat_id}: '{first} {last}'.strip() -> '{nome_finale}'")
+        return web.json_response({"ok": True, "nome_nuovo": nome_finale})
+
+    except Exception as e:
+        print(f"[RENAME ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def handle_send_audio(request: web.Request) -> web.Response:
     """
     POST /send-audio
@@ -682,7 +784,9 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
             filters = await get_dialog_filters()
 
             # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Attesa, Support che sono manuali)
-            AUTO_MANAGED_FOLDERS = ["Trattativa", "Contattare", "Perso"]
+            # NB: la cartella dei lead da ricontattare ora si chiama "Followup".
+            # "Contattare" e' passata al mondo clienti (arancione) e NON va toccata qui.
+            AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso"]
 
             target_filter = None
             for f in filters:
@@ -692,12 +796,16 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
                 folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
                 folder_title = folder_title.strip()
 
+                # Confronto tollerante: "VIP 🟢" deve corrispondere a "VIP"
+                is_target = _norm_folder(folder_title) == _norm_folder(target_folder_name)
+                is_auto = any(_norm_folder(folder_title) == _norm_folder(x) for x in AUTO_MANAGED_FOLDERS)
+
                 should_remove = False
-                if folder_title != target_folder_name:
+                if not is_target:
                     if exclusive:
-                        # Modalita' esclusiva: rimuovi da QUALSIASI altra cartella (usato per VIP)
+                        # Modalita' esclusiva: rimuovi da QUALSIASI altra cartella
                         should_remove = True
-                    elif folder_title in AUTO_MANAGED_FOLDERS:
+                    elif is_auto:
                         # Modalita' normale: rimuovi solo dalle cartelle auto-gestite
                         should_remove = True
 
@@ -707,7 +815,7 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
                         f.include_peers = new_peers
                         await client(UpdateDialogFilterRequest(id=f.id, filter=f))
 
-                if folder_title == target_folder_name:
+                if is_target:
                     target_filter = f
 
             if target_filter is None:
@@ -854,6 +962,7 @@ async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
     app.router.add_post("/send-audio",    handle_send_audio)
+    app.router.add_post("/rename-contact", handle_rename_contact)
     app.router.add_get("/health",         handle_healthcheck)
     app.router.add_get("/get-chats",      handle_get_chats)
     app.router.add_get("/get-single-chat", handle_get_single_chat)
