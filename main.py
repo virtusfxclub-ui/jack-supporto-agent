@@ -800,6 +800,7 @@ async def handle_get_folder_status(request: web.Request) -> web.Response:
             current_folder = folder_map.get(chat_id, "Nessuna cartella")
 
             chats_data.append({
+                "username": getattr(dialog.entity, 'username', None) or "",
                 "chat_id": chat_id,
                 "nome": full_name,
                 "cartella_attuale": current_folder
