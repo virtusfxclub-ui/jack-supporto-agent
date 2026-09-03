@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import os
+import re
 import tempfile
 from aiohttp import web
 from datetime import datetime
@@ -230,7 +231,34 @@ def clean_dashes(text: str) -> str:
     text = re.sub(r',\s*,', ',', text)
     text = re.sub(r'^\s*,\s*', '', text)
     return text.strip()
+def ricuci_testo(text: str) -> str:
+    """
+    Ripara gli a capo spuri introdotti da una risposta in streaming.
+    n8n puo' spedire la risposta a pezzi: i confini dei pezzi diventano '\n'
+    in mezzo alle parole ("segn\nali", "qu\nindi").
+    I doppi a capo veri vanno preservati: servono a separare i messaggi.
+    """
+    if not text or '\n' not in text:
+        return text
+
+    # Protegge i doppi a capo (separatori di messaggio) con un segnaposto
+    SEP = '\x00SEP\x00'
+    t = re.sub(r'\n\s*\n+', SEP, text)
+
+    # A capo singolo tra due caratteri di parola = parola spezzata -> ricuci senza spazio
+    t = re.sub(r'(?<=[\wàèéìòùÀÈÉÌÒÙ\'])\n(?=[\wàèéìòùÀÈÉÌÒÙ])', '', t)
+
+    # Tutti gli altri a capo singoli rimasti diventano spazi
+    t = t.replace('\n', ' ')
+
+    # Ripristina i separatori e normalizza gli spazi doppi
+    t = t.replace(SEP, '\n\n')
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    return t.strip()
+
+
 async def send_split_messages(chat_id, text):
+    text = ricuci_testo(text)
     text = clean_dashes(text)
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
