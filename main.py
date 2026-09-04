@@ -17,6 +17,11 @@ CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-1003808377504"))
 # richiedono un'azione di Jack vanno in "alert" (che lui tiene con le notifiche accese).
 TOPIC_CHAT = int(os.environ.get("TOPIC_CHAT", "2"))
 TOPIC_ALERT = int(os.environ.get("TOPIC_ALERT", "4"))
+# Topic "VIP": Jack inoltra qui il messaggio di un cliente e riceve la bozza di risposta.
+TOPIC_VIP = int(os.environ.get("TOPIC_VIP", "200"))
+
+# Bozze in attesa di invio: {message_id_bozza: {chat_id, nome, testo, chat_text, messaggio}}
+bozze_vip = {}
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
