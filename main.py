@@ -6,7 +6,7 @@ import tempfile
 from aiohttp import web
 from datetime import datetime
 import pytz
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
@@ -22,6 +22,9 @@ TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
+# La chiave NON va scritta qui: il repo e' pubblico (serve per gli audio).
+# Va impostata come variabile d'ambiente ANTHROPIC_API_KEY su Railway.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 PORT = int(os.environ.get("FOLLOWUP_SERVER_PORT", "8080"))
 DEBOUNCE_TEXT = 60
 DEBOUNCE_EXTRA_AUDIO = 15
@@ -111,6 +114,60 @@ async def get_chat_history(sender_id: int) -> str:
     except Exception as e:
         print(f"[HISTORY ERROR] {e}")
         return ""
+async def genera_bozza_vip(nome_cliente: str, chat_text: str, messaggio: str, istruzione: str = "") -> str:
+    """Chiede a Claude una bozza di risposta per un cliente VIP, nel tono di Jack."""
+    if not ANTHROPIC_API_KEY:
+        print("[BOZZA] Manca la variabile d'ambiente ANTHROPIC_API_KEY su Railway")
+        return ""
+    extra = f"\n\nISTRUZIONE DI JACK PER QUESTA RISCRITTURA: {istruzione}" if istruzione else ""
+    prompt = (
+        "Sei Jack di Virtus FX Club e stai rispondendo a un CLIENTE che ha gia' depositato "
+        "ed e' dentro la community VIP. Non e' un lead da convincere: e' un cliente da assistere.\n\n"
+        "COME SCRIVE JACK: calmo, diretto, sicuro. Frasi brevi, niente giri di parole, niente "
+        "formalismi. Da' sempre una risposta concreta, e se serve dice cosa fara' lui. "
+        "Mai promettere guadagni, mai dare numeri inventati, mai promesse sui risultati.\n\n"
+        f"CLIENTE: {nome_cliente}\n\n"
+        f"ULTIMI MESSAGGI DELLA CHAT:\n{chat_text}\n\n"
+        f"MESSAGGIO A CUI RISPONDERE:\n{messaggio}"
+        f"{extra}\n\n"
+        "Scrivi SOLO il testo della risposta da mandare al cliente, pronto da inviare. "
+        "Niente premesse, niente virgolette, niente spiegazioni su cosa hai scritto."
+    )
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 600,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            ) as r:
+                d = await r.json()
+                return (d.get("content", [{}])[0].get("text") or "").strip()
+    except Exception as e:
+        print(f"[BOZZA ERROR] {e}")
+        return ""
+
+
+def link_chat(sender_info: dict, sender_id) -> str:
+    """Link diretto alla chat: username se disponibile, altrimenti per ID."""
+    u = (sender_info or {}).get("username") or ""
+    return f"https://t.me/{u}" if u else f"tg://user?id={sender_id}"
+
+
+def _norm_folder(nome: str) -> str:
+    """Normalizza un nome cartella per il confronto: toglie emoji, spazi e maiuscole."""
+    if not nome:
+        return ""
+    return "".join(ch for ch in nome.lower() if ch.isalnum())
+
+
 async def notify_jack(text: str, topic: str = "alert", buttons=None):
     """
     Manda una notifica nel gruppo di controllo.
@@ -618,8 +675,129 @@ async def handle_incoming(event):
         print(f"[DEBOUNCE] {full_name} — tipo: {media_type} — attendo {debounce}s")
     except Exception as e:
         print(f"[EXCEPTION] {e}")
+def _topic_id(event):
+    """Restituisce l'id del topic in cui e' stato scritto il messaggio (None se nessuno)."""
+    r = getattr(event.message, 'reply_to', None)
+    if not r:
+        return None
+    return getattr(r, 'reply_to_top_id', None) or getattr(r, 'reply_to_msg_id', None)
+
+
+@client.on(events.NewMessage(chats=CONTROL_CHAT_ID))
+async def handle_topic_vip(event):
+    """
+    Topic VIP: Jack inoltra qui il messaggio di un cliente e riceve la bozza di risposta.
+    Rispondendo alla bozza con un'istruzione ("piu' corto", "digli che...") la rigenera.
+    """
+    if _topic_id(event) != TOPIC_VIP:
+        return
+
+    msg = event.message
+
+    # --- Caso 1: e' una risposta a una bozza -> rigenera con l'istruzione ---
+    reply_id = getattr(getattr(msg, 'reply_to', None), 'reply_to_msg_id', None)
+    if reply_id and reply_id in bozze_vip and not msg.forward:
+        istruzione = (msg.message or "").strip()
+        if not istruzione:
+            return
+        b = bozze_vip[reply_id]
+        await event.reply("✏️ Riscrivo...")
+        nuova = await genera_bozza_vip(b["nome"], b["chat_text"], b["messaggio"], istruzione)
+        if not nuova:
+            await event.reply("❌ Non sono riuscito a rigenerare la bozza.")
+            return
+        sent = await client.send_message(
+            CONTROL_CHAT_ID, nuova,
+            reply_to=TOPIC_VIP,
+            buttons=[[Button.inline("✅ Invia al cliente", f"vipsend:{b['chat_id']}".encode())]]
+        )
+        bozze_vip[sent.id] = {**b, "testo": nuova}
+        return
+
+    # --- Caso 2: messaggio inoltrato da un cliente -> genera la bozza ---
+    if not msg.forward:
+        return
+
+    fwd = msg.forward
+    cliente_id = getattr(getattr(fwd, 'sender_id', None), 'user_id', None) or getattr(fwd, 'sender_id', None)
+    nome_cliente = (getattr(fwd, 'from_name', None) or "").strip()
+
+    if not cliente_id:
+        # Privacy attiva sui forward: senza id non sappiamo a chi rispondere
+        await event.reply(
+            "⚠️ Non riesco a risalire al mittente (ha la privacy attiva sui messaggi inoltrati).\n"
+            "Scrivimi l'ID o l'username del cliente e ti preparo la bozza."
+        )
+        return
+
+    testo_cliente = (msg.message or "").strip()
+    if not testo_cliente:
+        await event.reply("⚠️ Il messaggio inoltrato non contiene testo.")
+        return
+
+    try:
+        ent = await client.get_entity(int(cliente_id))
+        nome_cliente = f"{getattr(ent, 'first_name', '') or ''} {getattr(ent, 'last_name', '') or ''}".strip() or nome_cliente
+    except Exception:
+        pass
+
+    await event.reply("✍️ Preparo la risposta...")
+
+    # Ultimi messaggi della chat col cliente, per dare contesto
+    chat_text = ""
+    try:
+        righe = []
+        async for m in client.iter_messages(int(cliente_id), limit=12):
+            if m.text:
+                chi = "Jack" if m.out else (nome_cliente or "Cliente")
+                righe.append(f"{chi}: {m.text}")
+        chat_text = "\n".join(reversed(righe))
+    except Exception as e:
+        print(f"[VIP] Storico non leggibile per {cliente_id}: {e}")
+
+    bozza = await genera_bozza_vip(nome_cliente or "Cliente", chat_text, testo_cliente)
+    if not bozza:
+        await event.reply("❌ Non sono riuscito a generare la bozza.")
+        return
+
+    sent = await client.send_message(
+        CONTROL_CHAT_ID, bozza,
+        reply_to=TOPIC_VIP,
+        buttons=[[Button.inline("✅ Invia al cliente", f"vipsend:{cliente_id}".encode())]]
+    )
+    bozze_vip[sent.id] = {
+        "chat_id": int(cliente_id),
+        "nome": nome_cliente or "Cliente",
+        "testo": bozza,
+        "chat_text": chat_text,
+        "messaggio": testo_cliente,
+    }
+    print(f"[VIP] Bozza pronta per {nome_cliente} ({cliente_id})")
+
+
+@client.on(events.CallbackQuery(pattern=b"vipsend:"))
+async def handle_vip_send(event):
+    """Bottone 'Invia al cliente': manda la bozza come @jacksupporto."""
+    try:
+        cliente_id = int(event.data.decode().split(":")[1])
+        msg_id = event.message_id
+        b = bozze_vip.get(msg_id)
+        if not b:
+            await event.answer("Bozza non trovata (server riavviato). Copia e incolla a mano.", alert=True)
+            return
+        await client.send_message(cliente_id, b["testo"])
+        await event.edit(f"✅ INVIATO a {b['nome']}\n\n{b['testo']}")
+        await event.answer("Inviato")
+        print(f"[VIP] Risposta inviata a {b['nome']} ({cliente_id})")
+    except Exception as e:
+        print(f"[VIP SEND ERROR] {e}")
+        await event.answer("Errore nell'invio", alert=True)
+
+
 @client.on(events.NewMessage(chats=CONTROL_CHAT_ID))
 async def handle_control(event):
+    if _topic_id(event) == TOPIC_VIP:
+        return
     text = event.message.message or ""
     if text.lower().startswith("riprendi"):
         parts = text.split()
