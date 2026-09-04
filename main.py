@@ -133,6 +133,12 @@ async def update_airtable_vip(chat_id: str):
                                 print(f"[AIRTABLE ERROR] Status: {patch_resp.status}")
     except Exception as e:
         print(f"[AIRTABLE VIP ERROR] {e}")
+def link_chat(sender_info: dict, sender_id) -> str:
+    """Link diretto alla chat: username se disponibile, altrimenti per ID."""
+    u = (sender_info or {}).get("username") or ""
+    return f"https://t.me/{u}" if u else f"tg://user?id={sender_id}"
+
+
 def _norm_folder(nome: str) -> str:
     """
     Normalizza un nome cartella per il confronto: toglie emoji, spazi e maiuscole.
@@ -144,16 +150,18 @@ def _norm_folder(nome: str) -> str:
     return "".join(ch for ch in nome.lower() if ch.isalnum())
 
 
-async def notify_jack(text: str, topic: str = "alert"):
+async def notify_jack(text: str, topic: str = "alert", buttons=None):
     """
     Manda una notifica nel gruppo di controllo.
     topic="chat"  -> flusso normale (messaggi in arrivo), si puo' silenziare
     topic="alert" -> richiede un'azione di Jack, notifiche accese
     """
     thread_id = TOPIC_CHAT if topic == "chat" else TOPIC_ALERT
-    payload = {"chat_id": CONTROL_CHAT_ID, "text": text}
+    payload = {"chat_id": CONTROL_CHAT_ID, "text": text, "disable_web_page_preview": True}
     if thread_id:
         payload["message_thread_id"] = thread_id
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -347,15 +355,28 @@ async def process_messages(sender_id, sender_info, debounce):
                         print(f"[STORICO] Flag ignorato (invio PDF disattivato) — chat {sender_id}")
                     clean_reply = reply_text.replace('[STORICO_LEAD]', '').strip()
 
+                    _link = link_chat(sender_info, sender_id)
+
                     # Alert dedicato: serve la procedura di chiusura conto AXI
                     if '[ALERT_CHIUSURA]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_CHIUSURA]', '').strip()
                         asyncio.create_task(notify_jack(
                             f"🟠 CHIUSURA CONTO AXI\n\n"
-                            f"👤 {sender_info['full_name']}\n"
-                            f"📱 ID: {sender_id}\n\n"
+                            f"👤 {sender_info['full_name']}\n\n"
                             f"Ha già un conto AXI con deposito: serve mandargli la mail "
-                            f"e il documento con la procedura di chiusura e riapertura.",
+                            f"e il documento con la procedura di chiusura e riapertura.\n\n"
+                            f"👉 Apri la chat: {_link}",
+                            topic="alert"
+                        ))
+
+                    # Alert dedicato: il lead dice di aver depositato -> serve accesso VIP
+                    if '[ALERT_DEPOSITO]' in clean_reply:
+                        clean_reply = clean_reply.replace('[ALERT_DEPOSITO]', '').strip()
+                        asyncio.create_task(notify_jack(
+                            f"🟢 DEPOSITO FATTO\n\n"
+                            f"👤 {sender_info['full_name']}\n\n"
+                            f"Dice di aver depositato: verifica e dagli l'accesso al VIP.\n\n"
+                            f"👉 Apri la chat: {_link}",
                             topic="alert"
                         ))
 
@@ -450,13 +471,14 @@ async def handle_incoming(event):
             return
         if sender_id in paused_leads:
             print(f"[PAUSED] {full_name} ha scritto ma è in pausa")
+            _link = f"https://t.me/{sender_username}" if sender_username else f"tg://user?id={sender_id}"
             await notify_jack(
                 f"⏸ LEAD IN PAUSA HA SCRITTO\n\n"
-                f"👤 {full_name} (@{sender_username})\n"
-                f"💬 Ha scritto: {event.message.message or '[media]'}\n\n"
-                f"Per riattivare l'agent copia e invia questo comando:\n"
-                f"riprendi {sender_id}",
-                topic="alert"
+                f"👤 {full_name}\n"
+                f"💬 {event.message.message or '[media]'}\n\n"
+                f"👉 Apri la chat: {_link}",
+                topic="alert",
+                buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]
             )
             return
         message_text = event.message.message or ""
@@ -488,14 +510,14 @@ async def handle_incoming(event):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
                 paused_leads.add(sender_id)
                 caption = f" — didascalia: \"{message_text}\"" if message_text else ""
+                _link = f"https://t.me/{sender_username}" if sender_username else f"tg://user?id={sender_id}"
                 await notify_jack(
                     f"🖼 IMMAGINE RICEVUTA{caption}\n\n"
-                    f"👤 {full_name} (@{sender_username})\n"
-                    f"📱 ID: {sender_id}\n\n"
-                    f"Vai nella chat e rispondi tu direttamente.\n"
-                    f"Per riattivare l'agent copia e invia:\n"
-                    f"riprendi {sender_id}",
-                    topic="alert"
+                    f"👤 {full_name}\n\n"
+                    f"Vai nella chat e rispondi tu direttamente.\n\n"
+                    f"👉 Apri la chat: {_link}",
+                    topic="alert",
+                    buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]
                 )
                 return
             elif isinstance(event.message.media, MessageMediaDocument):
@@ -637,6 +659,24 @@ async def handle_send_followup(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 PALLINI = ["\U0001F7E1", "\U0001F7E2", "\U0001F7E0", "\U0001F534"]  # giallo, verde, arancione, rosso
+
+async def handle_resume_lead(request: web.Request) -> web.Response:
+    """
+    POST /resume-lead
+    Body: {"chat_id": "123"}
+    Riattiva l'agent su un lead in pausa. Chiamato dal bottone "Riprendi agent".
+    """
+    try:
+        data = await request.json()
+        chat_id = int(data.get("chat_id"))
+        era_in_pausa = chat_id in paused_leads
+        paused_leads.discard(chat_id)
+        print(f"[RESUME] Lead {chat_id} riattivato (era in pausa: {era_in_pausa})")
+        return web.json_response({"ok": True, "era_in_pausa": era_in_pausa})
+    except Exception as e:
+        print(f"[RESUME ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
 
 async def handle_rename_contact(request: web.Request) -> web.Response:
     """
@@ -1027,6 +1067,7 @@ async def start_http_server():
     app.router.add_post("/send-followup", handle_send_followup)
     app.router.add_post("/send-audio",    handle_send_audio)
     app.router.add_post("/rename-contact", handle_rename_contact)
+    app.router.add_post("/resume-lead",    handle_resume_lead)
     app.router.add_get("/health",         handle_healthcheck)
     app.router.add_get("/get-chats",      handle_get_chats)
     app.router.add_get("/get-single-chat", handle_get_single_chat)
