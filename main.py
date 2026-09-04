@@ -111,45 +111,6 @@ async def get_chat_history(sender_id: int) -> str:
     except Exception as e:
         print(f"[HISTORY ERROR] {e}")
         return ""
-async def update_airtable_vip(chat_id: str):
-    """Aggiorna lo stato del lead VIP su Airtable a cliente"""
-    try:
-        search_url = f"https://api.airtable.com/v0/appxEMWaNLn7X9a31/Leads"
-        headers = {"Authorization": f"Bearer {os.environ.get('AIRTABLE_TOKEN', '')}"}
-        params = {"filterByFormula": f"{{chat_id}}='{chat_id}'"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, headers=headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    records = data.get("records", [])
-                    if records:
-                        record_id = records[0]["id"]
-                        patch_url = f"{search_url}/{record_id}"
-                        patch_data = {"fields": {"stato": "cliente"}}
-                        async with session.patch(patch_url, headers={**headers, "Content-Type": "application/json"}, json=patch_data) as patch_resp:
-                            if patch_resp.status == 200:
-                                print(f"[AIRTABLE] Lead {chat_id} aggiornato a cliente")
-                            else:
-                                print(f"[AIRTABLE ERROR] Status: {patch_resp.status}")
-    except Exception as e:
-        print(f"[AIRTABLE VIP ERROR] {e}")
-def link_chat(sender_info: dict, sender_id) -> str:
-    """Link diretto alla chat: username se disponibile, altrimenti per ID."""
-    u = (sender_info or {}).get("username") or ""
-    return f"https://t.me/{u}" if u else f"tg://user?id={sender_id}"
-
-
-def _norm_folder(nome: str) -> str:
-    """
-    Normalizza un nome cartella per il confronto: toglie emoji, spazi e maiuscole.
-    Serve perche' le cartelle su Telegram hanno il pallino nel nome ("VIP 🟢")
-    ma nel codice le referenziamo come "VIP".
-    """
-    if not nome:
-        return ""
-    return "".join(ch for ch in nome.lower() if ch.isalnum())
-
-
 async def notify_jack(text: str, topic: str = "alert", buttons=None):
     """
     Manda una notifica nel gruppo di controllo.
@@ -324,7 +285,9 @@ async def process_messages(sender_id, sender_info, debounce):
                 if resp.status == 200:
                     try:
                         reply_text = await resp.text()
-                        reply_text = reply_text.strip()
+                        # Ricuci SUBITO: se la risposta arriva in streaming i flag possono
+                        # essere spezzati ("[NOTIFICA_JAC\nK]") e i controlli sotto fallirebbero.
+                        reply_text = ricuci_testo(reply_text).strip()
                     except Exception:
                         reply_text = ""
                     if not reply_text:
@@ -396,8 +359,36 @@ async def process_messages(sender_id, sender_info, debounce):
                         # cosi' non resta mai scritto un flag letterale tipo "[AUDIO_2]" nel messaggio
                         clean_reply = clean_reply.replace(marker, "").strip()
 
-                    await send_split_messages(sender_id, clean_reply)
-                    print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
+                    # RETE DI SICUREZZA: se un flag e' sopravvissuto alla pulizia di n8n
+                    # (tipicamente perche' era spezzato dallo streaming), lo intercettiamo qui.
+                    # Senza questo il flag finisce visibile al lead e la notifica non parte.
+                    FLAG_RESIDUI = ['[NOTIFICA_JACK]', '[ESCALATION]', '[AGENT2]', '[STORICO_LEAD]',
+                                    '[ALERT_CHIUSURA]', '[ALERT_DEPOSITO]',
+                                    '[AUDIO_1]', '[AUDIO_2]', '[AUDIO_3]']
+                    flag_trovati = [fl for fl in FLAG_RESIDUI if fl in clean_reply]
+                    if flag_trovati:
+                        for fl in flag_trovati:
+                            clean_reply = clean_reply.replace(fl, '')
+                        clean_reply = re.sub(r'\n{3,}', '\n\n', clean_reply).strip()
+                        print(f"[FLAG RESIDUI] Ripuliti {flag_trovati} dalla risposta a {sender_id}")
+
+                        # Se il flag chiedeva l'intervento di Jack, la notifica va mandata comunque
+                        if '[NOTIFICA_JACK]' in flag_trovati or '[ESCALATION]' in flag_trovati:
+                            _l = link_chat(sender_info, sender_id)
+                            asyncio.create_task(notify_jack(
+                                f"⚫ SERVE IL TUO INTERVENTO\n\n"
+                                f"👤 {sender_info['full_name']}\n\n"
+                                f"L'agent ha chiesto di passare a te.\n\n"
+                                f"👉 Apri la chat: {_l}",
+                                topic="alert",
+                                buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]
+                            ))
+
+                    if not clean_reply.strip() and not audio_key_to_send:
+                        print(f"[MSG OUT] Nessun testo da inviare a {sender_id}")
+                    else:
+                        await send_split_messages(sender_id, clean_reply)
+                        print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
 
                     if audio_key_to_send:
                         try:
@@ -465,9 +456,24 @@ async def handle_incoming(event):
                 return
             print(f"[TEST MODE] Messaggio da tester: {full_name}")
         if "VIP" in full_name.upper():
-            print(f"[SKIP VIP] {full_name} — aggiorno Airtable a cliente")
-            # Aggiorna automaticamente lo stato su Airtable a cliente
-            asyncio.create_task(update_airtable_vip(str(sender_id)))
+            # I clienti VIP li gestisce Jack a mano: l'agent non risponde.
+            # Ma la notifica DEVE partire, altrimenti un cliente che scrive passa inosservato.
+            print(f"[SKIP VIP] {full_name} — non rispondo, notifico Jack")
+            try:
+                await client.send_read_acknowledge(sender_id, event.message)
+            except Exception:
+                pass
+            _link = f"https://t.me/{sender_username}" if sender_username else f"tg://user?id={sender_id}"
+            testo_msg = (event.message.message or "[media]").strip()
+            if len(testo_msg) > 300:
+                testo_msg = testo_msg[:300] + "..."
+            asyncio.create_task(notify_jack(
+                f"⭐ CLIENTE VIP HA SCRITTO\n\n"
+                f"👤 {full_name}\n"
+                f"💬 {testo_msg}\n\n"
+                f"👉 Apri la chat: {_link}",
+                topic="alert"
+            ))
             return
         if sender_id in paused_leads:
             print(f"[PAUSED] {full_name} ha scritto ma è in pausa")
