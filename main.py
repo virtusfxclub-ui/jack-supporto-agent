@@ -519,23 +519,12 @@ async def handle_incoming(event):
             print(f"[TEST MODE] Messaggio da tester: {full_name}")
         if "VIP" in full_name.upper():
             # I clienti VIP li gestisce Jack a mano: l'agent non risponde.
-            # Ma la notifica DEVE partire, altrimenti un cliente che scrive passa inosservato.
-            print(f"[SKIP VIP] {full_name} — non rispondo, notifico Jack")
-            try:
-                await client.send_read_acknowledge(sender_id, event.message)
-            except Exception:
-                pass
-            _link = f"https://t.me/{sender_username}" if sender_username else f"tg://user?id={sender_id}"
-            testo_msg = (event.message.message or "[media]").strip()
-            if len(testo_msg) > 300:
-                testo_msg = testo_msg[:300] + "..."
-            asyncio.create_task(notify_jack(
-                f"⭐ CLIENTE VIP HA SCRITTO\n\n"
-                f"👤 {full_name}\n"
-                f"💬 {testo_msg}\n\n"
-                f"👉 Apri la chat: {_link}",
-                topic="alert"
-            ))
+            # NIENTE notifica di gruppo qui: Jack riceve gia' la notifica nativa
+            # di Telegram sulla chat privata (l'agent non segna il messaggio come
+            # letto, quindi la notifica non viene soppressa). Un duplicato nel
+            # gruppo era solo rumore. Se in futuro l'agent rispondesse ai VIP,
+            # qui e' il punto giusto per reintrodurre l'alert.
+            print(f"[SKIP VIP] {full_name} — non rispondo, nessuna notifica di gruppo")
             return
         if sender_id in paused_leads:
             print(f"[PAUSED] {full_name} ha scritto ma è in pausa")
@@ -559,18 +548,24 @@ async def handle_incoming(event):
         except Exception as e:
             print(f"[READ] Impossibile segnare come letto {sender_id}: {e}")
 
-        # Notifica sul bot di controllo: serve perché il read receipt sopra sopprime
-        # la notifica push nativa di Telegram sugli altri dispositivi di Jack.
+        # Notifica sul topic chat SOLO per il primo messaggio di un lead nuovo:
+        # vedere ogni singola riga di ogni conversazione era pura saturazione.
+        # Finche' e' l'agent a gestire lo scambio non serve seguirlo messaggio
+        # per messaggio; quello che conta arriva comunque nel topic alert.
         try:
-            anteprima = message_text.strip() if message_text.strip() else "[media]"
-            if len(anteprima) > 200:
-                anteprima = anteprima[:200] + "..."
-            username_txt = f" (@{sender_username})" if sender_username else ""
-            asyncio.create_task(notify_jack(
-                f"💬 {full_name}{username_txt}\n"
-                f"{anteprima}",
-                topic="chat"
-            ))
+            e_gia_in_storico = sender_id in agent_messages and len(agent_messages.get(sender_id, [])) > 0
+            if not e_gia_in_storico:
+                anteprima = message_text.strip() if message_text.strip() else "[media]"
+                if len(anteprima) > 200:
+                    anteprima = anteprima[:200] + "..."
+                _link = link_chat({"username": sender_username}, sender_id)
+                asyncio.create_task(notify_jack(
+                    f"🆕 NUOVO LEAD\n\n"
+                    f"👤 {full_name}\n"
+                    f"💬 {anteprima}\n\n"
+                    f"👉 Apri la chat: {_link}",
+                    topic="chat"
+                ))
         except Exception as e:
             print(f"[NOTIFY] Errore notifica nuovo messaggio: {e}")
         if event.message.media:
