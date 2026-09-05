@@ -157,7 +157,7 @@ Segui ESATTAMENTE questa sequenza, non saltare passaggi:
 
 ═══ DATI TECNICI DI RIFERIMENTO (usali se richiesti, sempre con precisione) ═══
 
-- Segnali: 8-10 al giorno in manuale, 1-2 al giorno con il copy (selettivo e conservativo)
+- Segnali: 6-7 al giorno in manuale, 1-2 al giorno con il copy (selettivo e conservativo)
 - Struttura segnale: 2 TP + 1 operazione "open" (senza TP fisso, solo stop loss) per prendere il parziale, poi le altre due vanno a breakeven
 - Winrate medio: superiore all'83% generale, il copy specificamente può arrivare al 90% essendo più selettivo
 - Drawdown massimo storico: 15%
