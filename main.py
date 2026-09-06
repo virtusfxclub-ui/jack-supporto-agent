@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import os
+import json
 import re
 import tempfile
 from aiohttp import web
@@ -38,7 +39,30 @@ ITALY_TZ = pytz.timezone("Europe/Rome")
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
 pending_tasks = {}
-paused_leads = set()
+
+# --- paused_leads persistente su file ---
+# Prima viveva solo in RAM: ogni redeploy di Railway azzerava il set e i lead
+# in pausa tornavano a essere gestiti dall'agent senza che nessuno se ne accorgesse.
+PAUSED_LEADS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paused_leads.json")
+
+
+def _carica_paused_leads() -> set:
+    try:
+        with open(PAUSED_LEADS_FILE, "r") as fh:
+            return set(json.load(fh))
+    except Exception:
+        return set()
+
+
+def _salva_paused_leads():
+    try:
+        with open(PAUSED_LEADS_FILE, "w") as fh:
+            json.dump(list(paused_leads), fh)
+    except Exception as e:
+        print(f"[PAUSED_LEADS] Errore salvataggio: {e}")
+
+
+paused_leads = _carica_paused_leads()
 agent_messages   = {}
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
@@ -436,6 +460,7 @@ async def process_messages(sender_id, sender_info, debounce):
                     # Gestione BLOCK — proposta commerciale
                     if reply_text.startswith("[BLOCK]"):
                         paused_leads.add(sender_id)
+                        _salva_paused_leads()
                         print(f"[BLOCKED] {sender_info['full_name']} bloccato")
                         return
                     # Gestione PAUSE — escalation
@@ -449,6 +474,7 @@ async def process_messages(sender_id, sender_info, debounce):
                             )
                         await send_split_messages(sender_id, clean_reply)
                         paused_leads.add(sender_id)
+                        _salva_paused_leads()
                         print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
                         return
                     # STORICO PDF — DISATTIVATO. Il documento non va mai inviato a nessuno.
@@ -898,6 +924,7 @@ async def handle_control(event):
                 sender_id = int(parts[1])
                 if sender_id in paused_leads:
                     paused_leads.discard(sender_id)
+                    _salva_paused_leads()
                     await event.reply(f"✅ Agent riattivato per ID {sender_id} — risponderà al prossimo messaggio")
                     print(f"[RESUME] Lead {sender_id} riattivato")
                 else:
@@ -947,7 +974,27 @@ async def handle_resume_lead(request: web.Request) -> web.Response:
         chat_id = int(data.get("chat_id"))
         era_in_pausa = chat_id in paused_leads
         paused_leads.discard(chat_id)
+        _salva_paused_leads()
         print(f"[RESUME] Lead {chat_id} riattivato (era in pausa: {era_in_pausa})")
+
+        # Notifica visibile nel topic alert: il popup di Telegram sul bottone
+        # e' troppo discreto e facile da perdere, questa resta come messaggio.
+        try:
+            nome = ""
+            try:
+                ent = await client.get_entity(chat_id)
+                nome = f"{getattr(ent, 'first_name', '') or ''} {getattr(ent, 'last_name', '') or ''}".strip()
+            except Exception:
+                pass
+            _l = f"tg://user?id={chat_id}"
+            if era_in_pausa:
+                testo = f"🟢 ATTIVO\n\n{nome or chat_id} — agent riattivato, risponderà al prossimo messaggio.\n\n👉 Apri la chat: {_l}"
+            else:
+                testo = f"ℹ️ {nome or chat_id} non risultava in pausa (probabile riavvio del sistema nel frattempo). L'agent è già attivo su questo lead."
+            asyncio.create_task(notify_jack(testo, topic="alert"))
+        except Exception as e:
+            print(f"[RESUME NOTIFY ERROR] {e}")
+
         return web.json_response({"ok": True, "era_in_pausa": era_in_pausa})
     except Exception as e:
         print(f"[RESUME ERROR] {e}")
