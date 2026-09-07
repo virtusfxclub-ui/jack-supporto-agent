@@ -538,20 +538,31 @@ async def process_messages(sender_id, sender_info, debounce):
                         clean_reply = clean_reply.replace(marker, "").strip()
 
                     # RETE DI SICUREZZA: se un flag e' sopravvissuto alla pulizia di n8n
-                    # (tipicamente perche' era spezzato dallo streaming), lo intercettiamo qui.
-                    # Senza questo il flag finisce visibile al lead e la notifica non parte.
-                    FLAG_RESIDUI = ['[NOTIFICA_JACK]', '[ESCALATION]', '[AGENT2]', '[STORICO_LEAD]',
-                                    '[ALERT_CHIUSURA]', '[ALERT_DEPOSITO]', '[ALERT_VERIFICA_REFERRAL]',
-                                    '[AUDIO_1]', '[AUDIO_2]', '[AUDIO_3]']
-                    flag_trovati = [fl for fl in FLAG_RESIDUI if fl in clean_reply]
+                    # (streaming che lo spezza, o il modello che scrive una variante tipo
+                    # "[AGENT 2]" con spazio invece di "[AGENT2]"), lo intercettiamo qui.
+                    # Regex tollerante a spazi/underscore/maiuscole: un match esatto su
+                    # stringa lascerebbe passare qualsiasi piccola variazione.
+                    FLAG_PATTERNS = {
+                        'NOTIFICA_JACK': re.compile(r'\[\s*NOTIFICA[_\s]?JACK\s*\]', re.I),
+                        'ESCALATION': re.compile(r'\[\s*ESCALATION\s*\]', re.I),
+                        'AGENT2': re.compile(r'\[\s*AGENT\s*2\s*\]', re.I),
+                        'STORICO_LEAD': re.compile(r'\[\s*STORICO[_\s]?LEAD\s*\]', re.I),
+                        'ALERT_CHIUSURA': re.compile(r'\[\s*ALERT[_\s]?CHIUSURA\s*\]', re.I),
+                        'ALERT_DEPOSITO': re.compile(r'\[\s*ALERT[_\s]?DEPOSITO\s*\]', re.I),
+                        'ALERT_VERIFICA_REFERRAL': re.compile(r'\[\s*ALERT[_\s]?VERIFICA[_\s]?REFERRAL\s*\]', re.I),
+                        'AUDIO_1': re.compile(r'\[\s*AUDIO[_\s]?1\s*\]', re.I),
+                        'AUDIO_2': re.compile(r'\[\s*AUDIO[_\s]?2\s*\]', re.I),
+                        'AUDIO_3': re.compile(r'\[\s*AUDIO[_\s]?3\s*\]', re.I),
+                    }
+                    flag_trovati = [nome for nome, pat in FLAG_PATTERNS.items() if pat.search(clean_reply)]
                     if flag_trovati:
-                        for fl in flag_trovati:
-                            clean_reply = clean_reply.replace(fl, '')
+                        for nome in flag_trovati:
+                            clean_reply = FLAG_PATTERNS[nome].sub('', clean_reply)
                         clean_reply = re.sub(r'\n{3,}', '\n\n', clean_reply).strip()
                         print(f"[FLAG RESIDUI] Ripuliti {flag_trovati} dalla risposta a {sender_id}")
 
                         # Se il flag chiedeva l'intervento di Jack, la notifica va mandata comunque
-                        if '[NOTIFICA_JACK]' in flag_trovati or '[ESCALATION]' in flag_trovati:
+                        if 'NOTIFICA_JACK' in flag_trovati or 'ESCALATION' in flag_trovati:
                             _l = link_chat(sender_info, sender_id)
                             asyncio.create_task(notify_jack(
                                 f"⚫ SERVE IL TUO INTERVENTO\n\n"
