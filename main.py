@@ -63,6 +63,33 @@ def _salva_paused_leads():
 
 
 paused_leads = _carica_paused_leads()
+
+# --- stato lead persistente (v10) ---
+# rientri: {chat_id: timestamp_iso} lead usciti da Perso perche' hanno riscritto.
+# Il flusso follow-up n8n lo legge da /folder-status (campo `rientro`) e manda UN solo messaggio.
+LEAD_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_state.json")
+
+
+def _carica_lead_state() -> dict:
+    try:
+        with open(LEAD_STATE_FILE, "r") as fh:
+            d = json.load(fh)
+            if not isinstance(d, dict): d = {}
+            d.setdefault("rientri", {}); d.setdefault("cache", {})
+            return d
+    except Exception:
+        return {"rientri": {}, "cache": {}}
+
+
+def _salva_lead_state():
+    try:
+        with open(LEAD_STATE_FILE, "w") as fh:
+            json.dump(lead_state, fh)
+    except Exception as e:
+        print(f"[LEAD_STATE] Errore salvataggio: {e}")
+
+
+lead_state = _carica_lead_state()
 agent_messages   = {}
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
@@ -1135,207 +1162,183 @@ async def get_dialog_filters():
     return result.filters
 
 
+async def _leggi_stato_cartelle(giorni_attivita: int = 45):
+    """
+    Ritorna (chats, folder_ids). Per ogni chat privata attiva negli ultimi N giorni:
+    nome, chat_id, username, cartelle (LISTA di tutte le cartelle in cui sta),
+    cartella_attuale (una sola, scelta per priorita' fissa: retrocompatibilita' con n8n).
+    v10: prima /folder-status restituiva UNA cartella a caso (l'ultima letta) e leggeva
+    solo 200 dialoghi: oltre il 200esimo i lead sparivano dalla gestione.
+    """
+    filters = await get_dialog_filters()
+    folder_map = {}   # chat_id -> [folder_title, ...]
+    folder_ids = {}
+    for f in filters:
+        if hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers'):
+            folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
+            folder_title = folder_title.strip()
+            folder_ids[folder_title] = f.id
+            for peer in f.include_peers:
+                peer_id = getattr(peer, 'user_id', None) or getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
+                if peer_id:
+                    folder_map.setdefault(str(peer_id), []).append(folder_title)
+
+    me = await client.get_me()
+    cutoff = datetime.now(ITALY_TZ).timestamp() - (giorni_attivita * 24 * 3600)
+    chats_data = []
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_user or dialog.entity.bot or dialog.entity.id == me.id:
+            continue
+        if dialog.date and dialog.date.timestamp() < cutoff:
+            # iter_dialogs e' ordinato per data: da qui in poi sono tutti piu' vecchi
+            break
+        chat_id = str(dialog.entity.id)
+        full_name = f"{dialog.entity.first_name or ''} {dialog.entity.last_name or ''}".strip()
+        cartelle = folder_map.get(chat_id, [])
+        chats_data.append({
+            "username": getattr(dialog.entity, 'username', None) or "",
+            "chat_id": chat_id,
+            "nome": full_name,
+            "cartelle": cartelle,
+            "cartella_attuale": _cartella_prioritaria(cartelle),
+            "rientro": chat_id in lead_state.get("rientri", {}),
+            "ultimo_msg": dialog.date.isoformat() if dialog.date else "",
+        })
+    return chats_data, folder_ids
+
+
+# Ordine di priorita' quando una chat sta in piu' cartelle: la prima che matcha vince.
+# Serve solo per il campo legacy `cartella_attuale`; la logica v10 usa la lista completa.
+PRIORITA_CARTELLE = ["attesa", "vip", "contattare", "bruciati", "transfer", "followup", "perso", "trattativa"]
+
+
+def _cartella_prioritaria(cartelle):
+    if not cartelle:
+        return "Nessuna cartella"
+    normalizzate = {_norm_folder(c): c for c in cartelle}
+    for p in PRIORITA_CARTELLE:
+        if p in normalizzate:
+            return normalizzate[p]
+    return cartelle[0]
+
+
 async def handle_get_folder_status(request: web.Request) -> web.Response:
-    """
-    GET /folder-status
-    Restituisce per ogni chat privata: nome contatto, chat_id, e in quale cartella si trova
-    """
+    """GET /folder-status — vedi _leggi_stato_cartelle. Risposta retrocompatibile + campo `cartelle` e `rientro`."""
     try:
-        filters = await get_dialog_filters()
-        folder_map = {}  # chat_id -> folder_title
-        folder_ids = {}  # folder_title -> folder_id
-
-        for f in filters:
-            if hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers'):
-                folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
-                folder_title = folder_title.strip()
-                folder_ids[folder_title] = f.id
-                for peer in f.include_peers:
-                    peer_id = getattr(peer, 'user_id', None) or getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
-                    if peer_id:
-                        folder_map[str(peer_id)] = folder_title
-
-        chats_data = []
-        cutoff_30d = datetime.now(ITALY_TZ).timestamp() - (30 * 24 * 3600)
-        async for dialog in client.iter_dialogs(limit=200):
-            if not dialog.is_user:
-                continue
-            if dialog.entity.bot:
-                continue
-            me = await client.get_me()
-            if dialog.entity.id == me.id:
-                continue
-            # Salta dialoghi senza attività negli ultimi 30 giorni (riduce carico)
-            if dialog.date and dialog.date.timestamp() < cutoff_30d:
-                continue
-
-            chat_id = str(dialog.entity.id)
-            full_name = f"{dialog.entity.first_name or ''} {dialog.entity.last_name or ''}".strip()
-            current_folder = folder_map.get(chat_id, "Nessuna cartella")
-
-            chats_data.append({
-                "username": getattr(dialog.entity, 'username', None) or "",
-                "chat_id": chat_id,
-                "nome": full_name,
-                "cartella_attuale": current_folder
-            })
-
+        chats_data, folder_ids = await _leggi_stato_cartelle()
         return web.json_response({"ok": True, "chats": chats_data, "folder_ids": folder_ids})
-
     except Exception as e:
         print(f"[FOLDER-STATUS ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+async def move_chat_to_folder(chat_id: int, target_folder_name: str, exclusive: bool = False) -> dict:
+    """
+    Sposta una chat nella cartella indicata.
+    exclusive=True: rimuove da TUTTE le altre cartelle (clienti con pallino, VIP senza pallino).
+    exclusive=False: rimuove solo dalle cartelle auto-gestite dei lead (Trattativa/Followup/Perso).
+    folder_name vuoto + exclusive=True: rimuovi da tutte.
+    """
+    from telethon.tl.functions.messages import UpdateDialogFilterRequest
+
+    target_folder_name = (target_folder_name or "").strip()
+    solo_rimozione = (target_folder_name == "")
+    if solo_rimozione and not exclusive:
+        return {"ok": False, "error": "folder_name mancante"}
+
+    async with folder_lock:
+        entity = await client.get_entity(chat_id)
+        input_peer = await client.get_input_entity(entity)
+        filters = await get_dialog_filters()
+        AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso"]
+
+        target_filter = None
+        for f in filters:
+            if not (hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers')):
+                continue
+            folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
+            folder_title = folder_title.strip()
+            is_target = _norm_folder(folder_title) == _norm_folder(target_folder_name)
+            is_auto = any(_norm_folder(folder_title) == _norm_folder(x) for x in AUTO_MANAGED_FOLDERS)
+
+            should_remove = (not is_target) and (exclusive or is_auto)
+            if should_remove:
+                new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
+                if len(new_peers) != len(f.include_peers):
+                    f.include_peers = new_peers
+                    await client(UpdateDialogFilterRequest(id=f.id, filter=f))
+            if is_target:
+                target_filter = f
+
+        if solo_rimozione:
+            print(f"[FOLDER] Chat {chat_id} rimossa da tutte le cartelle")
+            return {"ok": True, "rimosso_da_tutte": True}
+        if target_filter is None:
+            return {"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}
+
+        already_in = any(getattr(p, 'user_id', None) == chat_id for p in target_filter.include_peers)
+        if not already_in:
+            target_filter.include_peers.append(input_peer)
+            await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
+        print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}' (exclusive={exclusive})")
+        return {"ok": True, "moved_to": target_folder_name}
+
+
 async def handle_move_to_folder(request: web.Request) -> web.Response:
-    """
-    POST /move-to-folder
-    Body: {"chat_id": "123456", "folder_name": "Trattativa", "exclusive": false}
-    Sposta una chat nella cartella specificata.
-    Se exclusive=true, rimuove la chat da TUTTE le altre cartelle gestite (usato per VIP).
-    Se exclusive=false (default), rimuove solo dalle cartelle auto-gestite (Trattativa/Contattare/Perso),
-    permettendo a una chat di stare in più cartelle manuali contemporaneamente (es. Attesa + Transfer).
-    """
+    """POST /move-to-folder  Body: {"chat_id": "123", "folder_name": "Trattativa", "exclusive": false}"""
     try:
-        from telethon.tl.functions.messages import UpdateDialogFilterRequest
-
         data = await request.json()
-        chat_id = int(data.get("chat_id"))
-        target_folder_name = data.get("folder_name", "").strip()
-        exclusive = bool(data.get("exclusive", False))
-
-        # folder_name vuoto + exclusive=true significa: rimuovi da TUTTE le cartelle
-        # (usato per i VIP senza pallino, che non devono stare da nessuna parte)
-        solo_rimozione = (target_folder_name == "")
-        if not target_folder_name and not exclusive:
-            return web.json_response({"ok": False, "error": "folder_name mancante"}, status=400)
-
-        # Lock per evitare che chiamate simultanee leggano filtri non aggiornati (race condition)
-        async with folder_lock:
-            entity = await client.get_entity(chat_id)
-            input_peer = await client.get_input_entity(entity)
-
-            filters = await get_dialog_filters()
-
-            # Cartelle gestite automaticamente dal bot (escludiamo VIP, Transfer, Attesa, Support che sono manuali)
-            # NB: la cartella dei lead da ricontattare ora si chiama "Followup".
-            # "Contattare" e' passata al mondo clienti (arancione) e NON va toccata qui.
-            AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso"]
-
-            target_filter = None
-            for f in filters:
-                if not (hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers')):
-                    continue
-
-                folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
-                folder_title = folder_title.strip()
-
-                # Confronto tollerante: "VIP 🟢" deve corrispondere a "VIP"
-                is_target = _norm_folder(folder_title) == _norm_folder(target_folder_name)
-                is_auto = any(_norm_folder(folder_title) == _norm_folder(x) for x in AUTO_MANAGED_FOLDERS)
-
-                should_remove = False
-                if not is_target:
-                    if exclusive:
-                        # Modalita' esclusiva: rimuovi da QUALSIASI altra cartella
-                        should_remove = True
-                    elif is_auto:
-                        # Modalita' normale: rimuovi solo dalle cartelle auto-gestite
-                        should_remove = True
-
-                if should_remove:
-                    new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
-                    if len(new_peers) != len(f.include_peers):
-                        f.include_peers = new_peers
-                        await client(UpdateDialogFilterRequest(id=f.id, filter=f))
-
-                if is_target:
-                    target_filter = f
-
-            if solo_rimozione:
-                print(f"[FOLDER] Chat {chat_id} rimossa da tutte le cartelle")
-                return web.json_response({"ok": True, "rimosso_da_tutte": True})
-
-            if target_filter is None:
-                return web.json_response({"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}, status=404)
-
-            already_in = any(getattr(p, 'user_id', None) == chat_id for p in target_filter.include_peers)
-            if not already_in:
-                target_filter.include_peers.append(input_peer)
-                await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
-
-            print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}' (exclusive={exclusive})")
-            return web.json_response({"ok": True, "moved_to": target_folder_name})
-
+        res = await move_chat_to_folder(int(data.get("chat_id")), data.get("folder_name", ""), bool(data.get("exclusive", False)))
+        status = 200 if res.get("ok") else (404 if "non trovata" in str(res.get("error", "")) else 400)
+        return web.json_response(res, status=status)
     except Exception as e:
         print(f"[MOVE-FOLDER ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+def _is_our_sender(sender: str) -> bool:
+    return sender in ("Agent", "Jack (manuale)")
+
+
+async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
+    """Legge i messaggi di una chat. Ritorna (entity, messaggi in ordine cronologico)."""
+    cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
+    entity = await client.get_entity(chat_id)
+    chat_agent_msgs = agent_messages.get(chat_id, [])
+    chat_sent_audios = sent_audios.get(chat_id, {})
+    messages = []
+    async for msg in client.iter_messages(entity, limit=limit):
+        if not msg.date or msg.date.timestamp() < cutoff:
+            break
+        if msg.text:
+            if msg.out:
+                sender = "Agent" if msg.text.strip() in chat_agent_msgs else "Jack (manuale)"
+            else:
+                sender = getattr(entity, 'first_name', None) or "Lead"
+            messages.append({"sender": sender, "text": msg.text, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
+            continue
+        # Vocali: senza testo, ma DEVONO comparire nello storico o l'agent li rimanda.
+        if getattr(msg, 'voice', None) and msg.out:
+            audio_key = chat_sent_audios.get(msg.id)
+            etichetta = f"[VOCALE GIA' INVIATO: {audio_key}]" if audio_key else "[VOCALE GIA' INVIATO]"
+            messages.append({"sender": "Agent", "text": etichetta, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
+    messages.reverse()
+    return entity, messages
+
+
 async def handle_get_single_chat(request: web.Request) -> web.Response:
-    """
-    GET /get-single-chat?chat_id=123456&hours=72&limit=5
-    Restituisce SOLO la chat specificata, senza scansionare tutti i dialoghi.
-    Molto più veloce di /get-chats quando serve una sola chat.
-    Parametro 'limit' opzionale (default 5, invariato per retrocompatibilità col sistema cartelle/follow-up).
-    Il workflow principale (routing Agent1/Agent2) passa un limit più alto (es. 200) per avere lo storico completo.
-    """
+    """GET /get-single-chat?chat_id=123456&hours=72&limit=5 (default invariati per retrocompatibilita')."""
     try:
         chat_id_str = request.rel_url.query.get("chat_id", "")
         if not chat_id_str:
             return web.json_response({"ok": False, "error": "chat_id mancante"}, status=400)
-
         chat_id = int(chat_id_str)
         hours = int(request.rel_url.query.get("hours", "72"))
         limit = int(request.rel_url.query.get("limit", "5"))
-        cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
-
-        entity = await client.get_entity(chat_id)
-        chat_agent_msgs = agent_messages.get(chat_id, [])
-
-        chat_sent_audios = sent_audios.get(chat_id, {})
-
-        messages = []
-        async for msg in client.iter_messages(entity, limit=limit):
-            if not msg.date or msg.date.timestamp() < cutoff:
-                break
-
-            if msg.text:
-                if msg.out:
-                    is_agent = msg.text.strip() in chat_agent_msgs
-                    sender = "Agent" if is_agent else "Jack (manuale)"
-                else:
-                    sender = getattr(entity, 'first_name', None) or "Lead"
-                messages.append({
-                    "sender": sender,
-                    "text": msg.text,
-                    "time": msg.date.strftime("%H:%M"),
-                    "timestamp_iso": msg.date.isoformat()
-                })
-                continue
-
-            # Vocali: non hanno testo, ma DEVONO comparire nello storico.
-            # Senza questo l'agent non sa di aver gia' mandato un audio e lo rimanda.
-            if getattr(msg, 'voice', None) and msg.out:
-                audio_key = chat_sent_audios.get(msg.id)
-                etichetta = f"[VOCALE GIA' INVIATO: {audio_key}]" if audio_key else "[VOCALE GIA' INVIATO]"
-                messages.append({
-                    "sender": "Agent",
-                    "text": etichetta,
-                    "time": msg.date.strftime("%H:%M"),
-                    "timestamp_iso": msg.date.isoformat()
-                })
-
-        messages.reverse()
+        entity, messages = await read_chat_messages(chat_id, hours, limit)
         full_name = f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip()
-
-        return web.json_response({
-            "ok": True,
-            "chat_id": str(chat_id),
-            "nome": full_name,
-            "messaggi": messages
-        })
-
+        return web.json_response({"ok": True, "chat_id": str(chat_id), "nome": full_name, "messaggi": messages,
+                                  "rientro": str(chat_id) in lead_state.get("rientri", {})})
     except Exception as e:
         print(f"[GET-SINGLE-CHAT ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -1396,6 +1399,253 @@ async def handle_get_chats(request: web.Request) -> web.Response:
     except Exception as e:
         print(f"[GET-CHATS ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+# ═══════════════════════════════════════════════════════════════════════
+# RICONCILIAZIONE CARTELLE (v10) — sostituisce il sotto-flusso n8n "Gestione Cartelle"
+# ═══════════════════════════════════════════════════════════════════════
+# Una sola macchina a stati, in un posto solo, con la lista COMPLETA delle cartelle per chat.
+#
+# CLIENTI (pallino nel nome): pallino -> cartella cliente, esclusiva. VIP senza pallino -> fuori da tutto.
+# TRANSFER / ATTESA / whitelist: non si toccano (li gestisce Lorenzo a mano).
+# LEAD (tutto il resto):
+#   - nessun messaggio                     -> skip
+#   - ultimo nostro, < 12h                 -> Trattativa
+#   - ultimo nostro, FU3 inviato e >= 72h  -> Perso
+#   - ultimo nostro, >= 12h                -> Followup
+#   - ultimo del lead, < 12h               -> Trattativa (l'agent sta rispondendo)
+#   - ultimo del lead, >= 12h              -> Claude decide TRATTATIVA / RINVIO / PERSO
+#   - lead in Perso che ha riscritto       -> Trattativa + flag `rientro` (follow-up ridotto a 1 msg)
+# Claude viene chiamato SOLO nell'ultimo caso ambiguo, con un tetto per esecuzione.
+
+# Testi follow-up: devono restare IDENTICI a FU_SEND / FU_MATCH nel nodo n8n "Decidi Azione Follow-Up".
+FU_TESTI = [
+    ["Fammi sapere se hai domande, sarei felice di averti in community", "Ciao, fammi sapere se hai domande"],
+    ["Nel gruppo continuiamo a condividere le operazioni ogni giorno, ci stai dando un'occhiata?",
+     "I posti in community stanno per finire, fammi sapere se sei ancora interessato", "Ei."],
+    ["Ti faccio una domanda secca: c'è qualcosa che non ti ha convinto?",
+     "Sarei contento di tenerti il posto e di averti in community con me",
+     "Non mi hai fatto sapere più nulla, aspettavo la tua risposta",
+     "Ho visto che sei tornato a scrivere"],   # follow-up unico post-rientro: conta come FU3 (poi -> Perso)
+]
+FU_RIENTRO_TESTO = "Ho visto che sei tornato a scrivere"  # prefisso del messaggio unico post-rientro (n8n)
+# Classificazione = una parola: Haiku basta e costa ~10x meno di Sonnet. Override con env MODELLO_CLASSIFICA.
+MODELLO_CLASSIFICA = os.environ.get("MODELLO_CLASSIFICA", "claude-haiku-4-5-20251001")
+
+CARTELLE_CLIENTI = {"attesa", "vip", "contattare", "bruciati"}
+CARTELLE_LEAD_AUTO = {"trattativa", "followup", "perso"}
+PALLINO_CARTELLA = {"\U0001F7E1": "Attesa", "\U0001F7E2": "VIP", "\U0001F7E0": "Contattare", "\U0001F534": "Bruciati"}
+
+PROMPT_CLASSIFICA_LEAD = """Analizza questa conversazione Telegram tra Jack (venditore, community copy trading) e un lead. L'ultimo messaggio e' del lead e non ha ancora ricevuto risposta da ore.
+Classifica lo stato in UNA sola parola:
+TRATTATIVA: il lead fa una domanda, porta avanti il discorso, chiede come procedere, mostra interesse attivo.
+RINVIO: il lead chiude con un rinvio anche cortese ("ok grazie", "va bene", "ti faccio sapere", "ci sentiamo", "lunedi'", "dopo le ferie") o con un messaggio breve e generico che non porta avanti nulla.
+PERSO: rifiuto netto e definitivo ("non mi interessa", "lasciamo perdere", "non voglio procedere", insulti, richiesta di non essere piu' contattato).
+
+CHAT:
+{chat}
+
+Rispondi SOLO con: TRATTATIVA oppure RINVIO oppure PERSO."""
+
+
+def _norm_txt(s: str) -> str:
+    return " ".join((s or "").split()).strip().lower()
+
+
+def _fu_index(testo: str):
+    """Ritorna 1..3 se il testo e' uno dei follow-up (nuovi o vecchi), altrimenti 0."""
+    t = _norm_txt(testo)
+    for i, varianti in enumerate(FU_TESTI, start=1):
+        for v in varianti:
+            v = _norm_txt(v)
+            if len(v) < 12:
+                if t == v:
+                    return i
+            elif v in t:
+                return i
+    return 0
+
+
+async def _claude_classifica_lead(chat_text: str) -> str:
+    if not ANTHROPIC_API_KEY:
+        return "TRATTATIVA"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": MODELLO_CLASSIFICA, "max_tokens": 10,
+                      "messages": [{"role": "user", "content": PROMPT_CLASSIFICA_LEAD.format(chat=chat_text)}]},
+                timeout=aiohttp.ClientTimeout(total=40),
+            ) as r:
+                d = await r.json()
+                out = (d.get("content", [{}])[0].get("text") or "").strip().upper()
+                for k in ("PERSO", "RINVIO", "TRATTATIVA"):
+                    if k in out:
+                        return k
+    except Exception as e:
+        print(f"[RECONCILE] Claude error: {e}")
+    return "TRATTATIVA"
+
+
+def _ore_da(ts_iso: str):
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        return (datetime.now(pytz.UTC) - dt).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: int = 45) -> dict:
+    chats, _ = await _leggi_stato_cartelle(giorni)
+    report = {"dry_run": dry_run, "totale_chat": len(chats), "movimenti": [], "anomalie": [], "claude_chiamate": 0,
+              "skip": {"cliente": 0, "manuale": 0, "senza_messaggi": 0, "budget_claude": 0, "gia_ok": 0, "cache": 0}}
+    now_iso = datetime.now(ITALY_TZ).isoformat()
+
+    for c in chats:
+        chat_id = int(c["chat_id"]); nome = c["nome"] or ""; nome_l = nome.lower()
+        cartelle = c["cartelle"]; cart_norm = {_norm_folder(x) for x in cartelle}
+        target = None; exclusive = False; motivo = ""
+
+        # ---- 1. clienti: decide il pallino ----
+        pallino = next((p for p in PALLINO_CARTELLA if p in nome), None)
+        if pallino:
+            target, exclusive, motivo = PALLINO_CARTELLA[pallino], True, f"pallino {pallino}"
+            if _norm_folder(target) in cart_norm and len(cartelle) == 1:
+                report["skip"]["gia_ok"] += 1; continue
+        elif "vip" in nome_l:
+            if not cartelle:
+                report["skip"]["gia_ok"] += 1; continue
+            target, exclusive, motivo = "", True, "VIP senza pallino: fuori da tutte le cartelle"
+        # ---- 2. gestiti a mano: mai toccare ----
+        elif any(k in nome_l for k in ("transfer", "whitelist", "white list")) or cart_norm & {"transfer", "attesa"}:
+            report["skip"]["manuale"] += 1; continue
+        elif cart_norm & (CARTELLE_CLIENTI - {"contattare"}):
+            report["skip"]["cliente"] += 1
+            report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": "in cartella clienti ma senza pallino nel nome"})
+            continue
+        # ---- 3. lead (compresi i vecchi lead rimasti in Contattare senza pallino: vanno tolti da li') ----
+        else:
+            exclusive = "contattare" in cart_norm
+            # CACHE: nessun messaggio nuovo dall'ultimo giro e cartelle invariate -> non rileggo nemmeno la chat.
+            # Vale solo se l'ultima decisione era "gia' a posto" E la situazione non dipende dal tempo che passa
+            # (Followup/Perso maturano con le ore: quelle si ricontrollano sempre).
+            cache = lead_state.setdefault("cache", {}).get(c["chat_id"])
+            if cache and cache.get("ultimo_msg") == c.get("ultimo_msg") and sorted(cache.get("cartelle", [])) == sorted(cartelle) \
+               and cache.get("stabile"):
+                report["skip"]["cache"] += 1; continue
+            try:
+                _, msgs = await read_chat_messages(chat_id, hours=giorni * 24, limit=60)
+            except Exception as e:
+                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "nota": f"lettura chat fallita: {e}"}); continue
+            if not msgs:
+                report["skip"]["senza_messaggi"] += 1; continue
+
+            last = msgs[-1]; last_ours = _is_our_sender(last["sender"]); ore = _ore_da(last["timestamp_iso"]) or 0
+            fu = 0; lead_dopo_fu = False
+            for m in msgs:
+                if _is_our_sender(m["sender"]):
+                    k = _fu_index(m["text"])
+                    if k: fu, lead_dopo_fu = k, False
+                elif fu:
+                    lead_dopo_fu = True
+            in_perso = "perso" in cart_norm
+
+            if last_ours:
+                if ore < 12:
+                    target, motivo = "Trattativa", f"ultimo nostro {ore:.0f}h fa"
+                elif fu >= 3 and ore >= 72 and not lead_dopo_fu:
+                    target, motivo = "Perso", "FU3 inviato, nessuna risposta da 72h"
+                elif in_perso and fu >= 3:
+                    report["skip"]["gia_ok"] += 1; continue
+                else:
+                    target, motivo = "Followup", f"ultimo nostro {ore:.0f}h fa, FU inviati: {fu}"
+            else:
+                if ore >= 48:
+                    report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"il lead ha scritto {ore:.0f}h fa e nessuno ha risposto"})
+                if ore < 12:
+                    target, motivo = "Trattativa", f"lead ha scritto {ore:.0f}h fa"
+                else:
+                    if report["claude_chiamate"] >= max_claude:
+                        report["skip"]["budget_claude"] += 1; continue
+                    chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-15:])
+                    esito = await _claude_classifica_lead(chat_text); report["claude_chiamate"] += 1
+                    target = {"PERSO": "Perso", "RINVIO": "Followup"}.get(esito, "Trattativa")
+                    motivo = f"Claude: {esito}"
+                if in_perso and target != "Perso":
+                    motivo += " · RIENTRO da Perso"
+                    if not dry_run:
+                        lead_state.setdefault("rientri", {})[c["chat_id"]] = now_iso; _salva_lead_state()
+
+            # rientro chiuso: se torna in Perso o e' passato troppo tempo, pulisci il flag
+            if target == "Perso" and c["chat_id"] in lead_state.get("rientri", {}) and not dry_run:
+                lead_state["rientri"].pop(c["chat_id"], None); _salva_lead_state()
+
+            # gia' a posto? (sta SOLO nella cartella target tra quelle auto)
+            if _norm_folder(target) in cart_norm and not (cart_norm & CARTELLE_LEAD_AUTO - {_norm_folder(target)}) and not exclusive:
+                report["skip"]["gia_ok"] += 1
+                # Stabile = non cambia col solo passare del tempo: Perso definitivo, oppure Followup con FU3 gia' partito
+                # ma non ancora maturo lo escludo (matura). Trattativa "ultimo nostro <12h" matura in Followup: NON stabile.
+                stabile = (target == "Perso") or (target == "Followup" and fu < 3 and last_ours)
+                # Followup con fu<3 e ultimo nostro: il passaggio FU1->FU2->FU3 lo fa n8n scrivendo un messaggio nuovo,
+                # quindi `ultimo_msg` cambia e la cache si invalida da sola.
+                if not dry_run:
+                    lead_state["cache"][c["chat_id"]] = {"ultimo_msg": c.get("ultimo_msg"), "cartelle": cartelle, "stabile": stabile}
+                continue
+            if not dry_run:
+                lead_state["cache"].pop(c["chat_id"], None)
+
+        mov = {"chat_id": c["chat_id"], "nome": nome, "da": cartelle, "a": target or "(nessuna)", "exclusive": exclusive, "motivo": motivo, "eseguito": False}
+        if not dry_run:
+            try:
+                res = await move_chat_to_folder(chat_id, target, exclusive)
+                mov["eseguito"] = bool(res.get("ok")); mov["esito"] = res
+            except Exception as e:
+                mov["esito"] = {"ok": False, "error": str(e)}
+        report["movimenti"].append(mov)
+
+    if not dry_run:
+        # pulizia: cache solo per chat ancora attive
+        attivi = {c["chat_id"] for c in chats}
+        lead_state["cache"] = {k: v for k, v in lead_state.get("cache", {}).items() if k in attivi}
+        _salva_lead_state()
+    print(f"[RECONCILE] dry_run={dry_run} chat={len(chats)} movimenti={len(report['movimenti'])} claude={report['claude_chiamate']} cache={report['skip']['cache']} anomalie={len(report['anomalie'])}")
+    return report
+
+
+async def handle_reconcile_folders(request: web.Request) -> web.Response:
+    """
+    GET  /reconcile-folders?dry_run=1&max_claude=40&notify=0
+    POST /reconcile-folders  {"dry_run": true, "max_claude": 40, "notify": false}
+    dry_run=true (DEFAULT): restituisce i movimenti proposti senza eseguirli.
+    """
+    try:
+        q = request.rel_url.query
+        body = {}
+        if request.method == "POST":
+            try: body = await request.json()
+            except Exception: body = {}
+        def _flag(k, default):
+            v = body.get(k, q.get(k, default))
+            return str(v).lower() in ("1", "true", "yes", "si") if not isinstance(v, bool) else v
+        dry_run = _flag("dry_run", True)
+        notify = _flag("notify", False)
+        max_claude = int(body.get("max_claude", q.get("max_claude", 40)))
+        report = await reconcile_folders(dry_run=dry_run, max_claude=max_claude)
+        if notify and (report["movimenti"] or report["anomalie"]):
+            righe = [f"📁 Cartelle {'(DRY RUN)' if dry_run else ''}: {len(report['movimenti'])} movimenti, {len(report['anomalie'])} anomalie"]
+            for m in report["movimenti"][:15]:
+                righe.append(f"• {m['nome']}: {', '.join(m['da']) or '—'} → {m['a']} ({m['motivo']})")
+            for a in report["anomalie"][:10]:
+                righe.append(f"⚠️ {a['nome']}: {a['nota']}")
+            await notify_jack("\n".join(righe), topic="alert")
+        return web.json_response({"ok": True, **report})
+    except Exception as e:
+        print(f"[RECONCILE ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def start_http_server():
     app = web.Application()
     app.router.add_post("/send-followup", handle_send_followup)
@@ -1407,6 +1657,8 @@ async def start_http_server():
     app.router.add_get("/get-single-chat", handle_get_single_chat)
     app.router.add_get("/folder-status",  handle_get_folder_status)
     app.router.add_post("/move-to-folder", handle_move_to_folder)
+    app.router.add_get("/reconcile-folders",  handle_reconcile_folders)
+    app.router.add_post("/reconcile-folders", handle_reconcile_folders)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
