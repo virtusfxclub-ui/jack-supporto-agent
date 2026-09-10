@@ -1529,6 +1529,10 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             if _norm_folder(target) in cart_norm and len(cartelle) == 1:
                 report["skip"]["gia_ok"] += 1; continue
         elif "vip" in nome_l:
+            # Cliente reale senza pallino = invisibile in tutte le cartelle. Lo segnalo ogni giro finche' non ha il pallino.
+            spam = any(k in nome_l for k in ("agency", "supporto", "support", "test", "limited"))
+            if not spam:
+                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": "VIP SENZA PALLINO: aggiungi 🟢/🟡/🟠/🔴 nel nome o resta fuori da tutte le cartelle"})
             if not cartelle:
                 report["skip"]["gia_ok"] += 1; continue
             target, exclusive, motivo = "", True, "VIP senza pallino: fuori da tutte le cartelle"
@@ -1566,8 +1570,9 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
                     lead_dopo_fu = True
             in_perso = "perso" in cart_norm
 
+            ultimo_e_fu = last_ours and _fu_index(last["text"]) > 0
             if last_ours:
-                if ore < 12:
+                if ore < 12 and not ultimo_e_fu:
                     target, motivo = "Trattativa", f"ultimo nostro {ore:.0f}h fa"
                 elif fu >= 3 and ore >= 72 and not lead_dopo_fu:
                     target, motivo = "Perso", "FU3 inviato, nessuna risposta da 72h"
@@ -1576,7 +1581,10 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
                 else:
                     target, motivo = "Followup", f"ultimo nostro {ore:.0f}h fa, FU inviati: {fu}"
             else:
-                if ore >= 48:
+                in_pausa = chat_id in paused_leads
+                if in_pausa:
+                    report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"AGENT IN PAUSA: il lead ha scritto {ore:.0f}h fa senza risposta (premi Riprendi agent o rispondi tu)"})
+                elif ore >= 48:
                     report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"il lead ha scritto {ore:.0f}h fa e nessuno ha risposto"})
                 if ore >= 168:
                     # Oltre 7 giorni senza nostra risposta: rimetterlo in Trattativa non serve (nessuno rispondera').
@@ -1655,7 +1663,8 @@ async def handle_reconcile_folders(request: web.Request) -> web.Response:
             righe = [f"📁 Cartelle {'(DRY RUN)' if dry_run else ''}: {len(report['movimenti'])} movimenti, {len(report['anomalie'])} anomalie"]
             for m in report["movimenti"][:15]:
                 righe.append(f"• {m['nome']}: {', '.join(m['da']) or '—'} → {m['a']} ({m['motivo']})")
-            for a in report["anomalie"][:10]:
+            anomalie = sorted(report["anomalie"], key=lambda a: 0 if "PAUSA" in a["nota"] else 1)
+            for a in anomalie[:20]:
                 righe.append(f"⚠️ {a['nome']}: {a['nota']}")
             await notify_jack("\n".join(righe), topic="alert")
         return web.json_response({"ok": True, **report})
