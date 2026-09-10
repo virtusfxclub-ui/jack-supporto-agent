@@ -1189,6 +1189,8 @@ async def _leggi_stato_cartelle(giorni_attivita: int = 45):
     async for dialog in client.iter_dialogs():
         if not dialog.is_user or dialog.entity.bot or dialog.entity.id == me.id:
             continue
+        if dialog.entity.id in (777000, 42777, 1087968824):  # chat di servizio Telegram / notifiche
+            continue
         if dialog.date and dialog.date.timestamp() < cutoff:
             # iter_dialogs e' ordinato per data: da qui in poi sono tutti piu' vecchi
             break
@@ -1247,7 +1249,7 @@ async def move_chat_to_folder(chat_id: int, target_folder_name: str, exclusive: 
         return {"ok": False, "error": "folder_name mancante"}
 
     async with folder_lock:
-        entity = await client.get_entity(chat_id)
+        entity = await _get_entity_robusto(chat_id)
         input_peer = await client.get_input_entity(entity)
         filters = await get_dialog_filters()
         AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso"]
@@ -1296,6 +1298,18 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+async def _get_entity_robusto(chat_id: int):
+    """get_entity con fallback: dopo un redeploy la cache entita' e' vuota e get_entity(int) fallisce
+    finche' il contatto non viene 'visto'. Il fallback scorre i dialoghi (che popolano la cache)."""
+    try:
+        return await client.get_entity(chat_id)
+    except Exception:
+        async for d in client.iter_dialogs():
+            if d.is_user and d.entity.id == chat_id:
+                return d.entity
+        raise
+
+
 def _is_our_sender(sender: str) -> bool:
     return sender in ("Agent", "Jack (manuale)")
 
@@ -1303,7 +1317,7 @@ def _is_our_sender(sender: str) -> bool:
 async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
     """Legge i messaggi di una chat. Ritorna (entity, messaggi in ordine cronologico)."""
     cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
-    entity = await client.get_entity(chat_id)
+    entity = await _get_entity_robusto(chat_id)
     chat_agent_msgs = agent_messages.get(chat_id, [])
     chat_sent_audios = sent_audios.get(chat_id, {})
     messages = []
@@ -1564,6 +1578,10 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             else:
                 if ore >= 48:
                     report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"il lead ha scritto {ore:.0f}h fa e nessuno ha risposto"})
+                if ore >= 168:
+                    # Oltre 7 giorni senza nostra risposta: rimetterlo in Trattativa non serve (nessuno rispondera').
+                    # Resta dove sta, segnalato come anomalia, senza spendere una chiamata Claude.
+                    report["skip"]["gia_ok"] += 1; continue
                 if ore < 12:
                     target, motivo = "Trattativa", f"lead ha scritto {ore:.0f}h fa"
                 else:
