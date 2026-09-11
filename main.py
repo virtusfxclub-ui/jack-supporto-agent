@@ -1522,6 +1522,12 @@ CHAT:
 Rispondi SOLO con: TRATTATIVA oppure RINVIO oppure PERSO."""
 
 
+def _link_lead(c: dict) -> str:
+    """Link apribile alla chat: username se c'e', altrimenti tg://user?id=."""
+    u = (c.get("username") or "").lstrip("@")
+    return f"https://t.me/{u}" if u else f"tg://user?id={c.get('chat_id')}"
+
+
 def _norm_txt(s: str) -> str:
     return " ".join((s or "").split()).strip().lower()
 
@@ -1593,7 +1599,7 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             # Cliente reale senza pallino = invisibile in tutte le cartelle. Lo segnalo ogni giro finche' non ha il pallino.
             spam = any(k in nome_l for k in ("agency", "supporto", "support", "test", "limited"))
             if not spam:
-                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": "VIP SENZA PALLINO: aggiungi 🟢/🟡/🟠/🔴 nel nome o resta fuori da tutte le cartelle"})
+                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "cartelle": cartelle, "nota": "VIP SENZA PALLINO: aggiungi 🟢/🟡/🟠/🔴 nel nome o resta fuori da tutte le cartelle"})
             if not cartelle:
                 report["skip"]["gia_ok"] += 1; continue
             target, exclusive, motivo = "", True, "VIP senza pallino: fuori da tutte le cartelle"
@@ -1602,7 +1608,7 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             report["skip"]["manuale"] += 1; continue
         elif cart_norm & (CARTELLE_CLIENTI - {"contattare"}):
             report["skip"]["cliente"] += 1
-            report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": "in cartella clienti ma senza pallino nel nome"})
+            report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "cartelle": cartelle, "nota": "in cartella clienti ma senza pallino nel nome"})
             continue
         # ---- 3. lead (compresi i vecchi lead rimasti in Contattare senza pallino: vanno tolti da li') ----
         else:
@@ -1617,7 +1623,7 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             try:
                 _, msgs = await read_chat_messages(chat_id, hours=giorni * 24, limit=60)
             except Exception as e:
-                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "nota": f"lettura chat fallita: {e}"}); continue
+                report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "nota": f"lettura chat fallita: {e}"}); continue
             if not msgs:
                 report["skip"]["senza_messaggi"] += 1; continue
 
@@ -1644,9 +1650,7 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             else:
                 in_pausa = chat_id in paused_leads
                 if in_pausa:
-                    report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"AGENT IN PAUSA: il lead ha scritto {ore:.0f}h fa senza risposta (premi Riprendi agent o rispondi tu)"})
-                elif ore >= 48:
-                    report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "cartelle": cartelle, "nota": f"il lead ha scritto {ore:.0f}h fa e nessuno ha risposto"})
+                    report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "cartelle": cartelle, "nota": f"AGENT IN PAUSA: il lead ha scritto {ore:.0f}h fa e aspetta (Riprendi agent o rispondi tu)"})
                 if ore >= 168:
                     # Oltre 7 giorni senza nostra risposta: rimetterlo in Trattativa non serve (nessuno rispondera').
                     # Resta dove sta, segnalato come anomalia, senza spendere una chiamata Claude.
@@ -1683,7 +1687,7 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             if not dry_run:
                 lead_state["cache"].pop(c["chat_id"], None)
 
-        mov = {"chat_id": c["chat_id"], "nome": nome, "da": cartelle, "a": target or "(nessuna)", "exclusive": exclusive, "motivo": motivo, "eseguito": False}
+        mov = {"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "da": cartelle, "a": target or "(nessuna)", "exclusive": exclusive, "motivo": motivo, "eseguito": False}
         if not dry_run:
             try:
                 res = await move_chat_to_folder(chat_id, target, exclusive)
@@ -1721,12 +1725,18 @@ async def handle_reconcile_folders(request: web.Request) -> web.Response:
         max_claude = int(body.get("max_claude", q.get("max_claude", 40)))
         report = await reconcile_folders(dry_run=dry_run, max_claude=max_claude)
         if notify and (report["movimenti"] or report["anomalie"]):
-            righe = [f"📁 Cartelle {'(DRY RUN)' if dry_run else ''}: {len(report['movimenti'])} movimenti, {len(report['anomalie'])} anomalie"]
-            for m in report["movimenti"][:15]:
-                righe.append(f"• {m['nome']}: {', '.join(m['da']) or '—'} → {m['a']} ({m['motivo']})")
+            righe = [f"📁 Cartelle{' (DRY RUN)' if dry_run else ''}: {len(report['movimenti'])} spostamenti, {len(report['anomalie'])} da sistemare"]
+            if report["movimenti"]:
+                righe.append("")
+                for m in report["movimenti"][:15]:
+                    righe.append(f"• {m['nome']} — {', '.join(m['da']) or 'nessuna'} → {m['a']} ({m['motivo']})\n  {m['link']}")
+                if len(report["movimenti"]) > 15:
+                    righe.append(f"  … e altri {len(report['movimenti']) - 15}")
             anomalie = sorted(report["anomalie"], key=lambda a: 0 if "PAUSA" in a["nota"] else 1)
-            for a in anomalie[:20]:
-                righe.append(f"⚠️ {a['nome']}: {a['nota']}")
+            if anomalie:
+                righe.append("\n🔧 DA SISTEMARE (spariscono al giro dopo):")
+                for a in anomalie[:20]:
+                    righe.append(f"⚠️ {a['nome']}: {a['nota']}\n  {a['link']}")
             await notify_jack("\n".join(righe), topic="alert")
         return web.json_response({"ok": True, **report})
     except Exception as e:
