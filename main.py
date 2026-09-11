@@ -133,10 +133,16 @@ async def carica_audio_bytes(audio_key: str):
     return None
 
 
+NIGHT_START = int(os.environ.get("NIGHT_START", "23"))  # ora italiana di inizio notte (inclusa)
+NIGHT_END = int(os.environ.get("NIGHT_END", "9"))       # ora italiana di fine notte (esclusa)
+
+
 def is_night_time():
-    """Controlla se è notte in Italia (00:00 - 08:00)"""
-    now = datetime.now(ITALY_TZ)
-    return 0 <= now.hour < 8
+    """Notte in Italia: da NIGHT_START a NIGHT_END (default 23:00 - 09:00). Modificabile da env senza toccare il codice."""
+    h = datetime.now(ITALY_TZ).hour
+    if NIGHT_START > NIGHT_END:          # finestra a cavallo di mezzanotte (es. 23 -> 9)
+        return h >= NIGHT_START or h < NIGHT_END
+    return NIGHT_START <= h < NIGHT_END
 def get_night_bridge_message(first_name: str, context_hint: str = "") -> str:
     """Restituisce il messaggio bridge notturno appropriato in base all'ora"""
     name = first_name or ""
@@ -153,7 +159,7 @@ def get_night_bridge_message(first_name: str, context_hint: str = "") -> str:
         action = "ti rispondo"
     # NIENTE nome qui: il main conosce solo il nome del profilo Telegram (spesso un
     # nickname o un brand tipo "Trading LM"), non quello dichiarato dal lead in chat.
-    if 0 <= hour < 3:
+    if hour >= 23 or hour < 3:
         return f"Guarda, sto andando a letto adesso. Ti scrivo direttamente quando sono in ufficio e {action}, ok?"
     else:
         return f"Guarda, appena sono in ufficio ti scrivo io personalmente e {action}, ok?"
