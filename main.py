@@ -1,4 +1,5 @@
 import asyncio
+import time
 import aiohttp
 import os
 import json
@@ -38,6 +39,11 @@ MAX_HISTORY_MESSAGES = 150
 ITALY_TZ = pytz.timezone("Europe/Rome")
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
+# ultimo istante in cui il lead risultava "sta scrivendo" (da UpdateUserTyping). Serve al debounce:
+# se il lead sta ancora digitando dopo i 60s, aspettiamo che smetta prima di rispondere a tutto insieme.
+last_typing = {}
+TYPING_GRACE = 8          # secondi di silenzio dalla tastiera prima di considerare finito il messaggio
+TYPING_MAX_EXTRA = 120    # tetto all'attesa extra, per non restare appesi
 pending_tasks = {}
 
 # --- paused_leads persistente su file ---
@@ -412,10 +418,13 @@ def ricuci_testo(text: str) -> str:
     if not text or '\n' not in text:
         return text
 
-    # Protegge i doppi a capo (separatori di messaggio) con un segnaposto
-    SEP = '\x00SEP\x00'
-    t = re.sub(r'\n\s*\n+', SEP, text)
+    # Doppio a capo SPURIO (chunk vuoto dello streaming n8n) che taglia una frase a meta': prima una lettera/virgola,
+    # dopo una minuscola o punteggiatura -> e' uno spazio, non un separatore di messaggio. Va fatto PRIMA di proteggere i separatori.
+    t = re.sub(r"(?<=[\wàèéìòùÀÈÉÌÒÙ,;:'’])\n[ \t]*\n+(?=[ \t]*[a-zàèéìòù0-9,;:.!?)])", ' ', text)
 
+    # Protegge i doppi a capo VERI (separatori di messaggio) con un segnaposto
+    SEP = '\x00SEP\x00'
+    t = re.sub(r'\n\s*\n+', SEP, t)
     # A capo singolo tra due caratteri di parola (lettere, cifre, _, apostrofi) = parola spezzata -> ricuci senza spazio
     t = re.sub(r"(?<=[\wàèéìòùÀÈÉÌÒÙ'’])\n(?=[\wàèéìòùÀÈÉÌÒÙ'’])", '', t)
     # A capo davanti a punteggiatura di chiusura / dopo apertura -> via
@@ -456,6 +465,13 @@ async def send_split_messages(chat_id, text):
             await asyncio.sleep(delay)
 async def process_messages(sender_id, sender_info, debounce):
     await asyncio.sleep(debounce)
+    # Se il lead sta ancora scrivendo, aspetto che smetta (max TYPING_MAX_EXTRA): cosi' rispondo a tutto in una volta
+    # invece di dare due risposte separate a un messaggio spezzato in due.
+    extra = 0
+    while extra < TYPING_MAX_EXTRA and (time.time() - last_typing.get(sender_id, 0)) < TYPING_GRACE:
+        await asyncio.sleep(3); extra += 3
+    if extra:
+        print(f"[DEBOUNCE] {sender_info.get('full_name')} stava scrivendo: atteso {extra}s in piu'")
     if sender_id in paused_leads:
         print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
         pending_messages.pop(sender_id, None)
@@ -677,6 +693,16 @@ async def process_messages(sender_id, sender_info, debounce):
                     print(f"[ERROR] n8n status: {resp.status}")
     except Exception as e:
         print(f"[EXCEPTION] {e}")
+@client.on(events.UserUpdate)
+async def on_user_typing(event):
+    """Traccia lo stato 'sta scrivendo' dei lead (chat private) per il debounce."""
+    try:
+        if event.typing and getattr(event, 'user_id', None):
+            last_typing[event.user_id] = time.time()
+    except Exception:
+        pass
+
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_incoming(event):
     try:
