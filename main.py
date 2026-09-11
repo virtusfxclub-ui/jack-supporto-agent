@@ -517,6 +517,22 @@ async def process_messages(sender_id, sender_info, debounce):
                         paused_leads.add(sender_id)
                         _salva_paused_leads()
                         print(f"[PAUSED] {sender_info['full_name']} messo in pausa dopo escalation")
+                        # NOTIFICA DAL MAIN, nel punto esatto in cui il lead viene messo in pausa.
+                        # Non dipende da n8n: se l'agent si ferma, Jack lo sa. Sempre.
+                        try:
+                            _l = link_chat(sender_info, sender_id)
+                            await notify_jack(
+                                f"⚫ ESCALATION - CHIUDI TU\n\n"
+                                f"👤 {sender_info['full_name']}\n\n"
+                                f"Ultimo messaggio:\n{combined_text[:400]}\n\n"
+                                f"Risposta inviata:\n{clean_reply[:600] or '(nessuna)'}\n\n"
+                                f"⏸ Agent in pausa su questa chat.\n"
+                                f"👉 Apri la chat: {_l}",
+                                topic="alert",
+                                buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]
+                            )
+                        except Exception as _e:
+                            print(f"[NOTIFY ERROR] escalation {sender_id}: {_e}")
                         return
                     # STORICO PDF — DISATTIVATO. Il documento non va mai inviato a nessuno.
                     # Il marker viene comunque ripulito dal testo come rete di sicurezza,
@@ -1318,10 +1334,15 @@ async def _get_entity_robusto(chat_id: int):
     try:
         return await client.get_entity(chat_id)
     except Exception:
+        trovato = None
         async for d in client.iter_dialogs():
-            if d.is_user and d.entity.id == chat_id:
-                return d.entity
-        raise
+            if getattr(d, 'id', None) == chat_id or (d.entity is not None and getattr(d.entity, 'id', None) == chat_id):
+                trovato = d.entity
+                break
+        if trovato is not None:
+            return trovato
+        # il giro sui dialoghi ha popolato la cache: ultimo tentativo
+        return await client.get_entity(chat_id)
 
 
 def _is_our_sender(sender: str) -> bool:
@@ -1715,6 +1736,16 @@ async def main():
         return
     me = await client.get_me()
     print(f"✅ Connesso come {me.first_name} (@{me.username})")
+    # WARM-UP cache entita': dopo un redeploy Telethon non conosce piu' nessun contatto e
+    # /get-single-chat risponde 500 ("Could not find the input entity") finche' il lead non riscrive.
+    # Scorrere i dialoghi una volta popola la cache per tutti (follow-up e riconciliazione inclusi).
+    try:
+        n_dial = 0
+        async for _d in client.iter_dialogs():
+            n_dial += 1
+        print(f"📇 Cache entita' pronta: {n_dial} dialoghi")
+    except Exception as e:
+        print(f"[WARN] warm-up dialoghi fallito: {e}")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
     print(f"🌙 Modalità notte attiva: {is_night_time()}")
