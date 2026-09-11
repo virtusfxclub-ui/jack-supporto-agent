@@ -391,6 +391,17 @@ def clean_dashes(text: str) -> str:
     text = re.sub(r',\s*,', ',', text)
     text = re.sub(r'^\s*,\s*', '', text)
     return text.strip()
+def normalizza_flag(text: str) -> str:
+    """"[AUDIO_ 1]", "[NOTIFICA_\nJACK]", "[AGENT 2]" -> "[AUDIO_1]", "[NOTIFICA_JACK]", "[AGENT2]".
+    Lo streaming di n8n spezza i flag; senza questa normalizzazione finiscono scritti al lead."""
+    if not text or '[' not in text:
+        return text
+    def _fix(m):
+        compact = re.sub(r'\s+', '', m.group(1)).upper()
+        return f'[{compact}]' if re.fullmatch(r'[A-Z0-9_]+', compact) else m.group(0)
+    return re.sub(r'\[\s*([A-Za-z0-9_\s]{1,40}?)\s*\]', _fix, text)
+
+
 def ricuci_testo(text: str) -> str:
     """
     Ripara gli a capo spuri introdotti da una risposta in streaming.
@@ -405,8 +416,11 @@ def ricuci_testo(text: str) -> str:
     SEP = '\x00SEP\x00'
     t = re.sub(r'\n\s*\n+', SEP, text)
 
-    # A capo singolo tra due caratteri di parola = parola spezzata -> ricuci senza spazio
-    t = re.sub(r'(?<=[\wàèéìòùÀÈÉÌÒÙ\'])\n(?=[\wàèéìòùÀÈÉÌÒÙ])', '', t)
+    # A capo singolo tra due caratteri di parola (lettere, cifre, _, apostrofi) = parola spezzata -> ricuci senza spazio
+    t = re.sub(r"(?<=[\wàèéìòùÀÈÉÌÒÙ'’])\n(?=[\wàèéìòùÀÈÉÌÒÙ'’])", '', t)
+    # A capo davanti a punteggiatura di chiusura / dopo apertura -> via
+    t = re.sub(r'\n(?=[,.;:!?)\]»”%€$])', '', t)
+    t = re.sub(r'(?<=[(\[«“€$])\n', '', t)
 
     # Tutti gli altri a capo singoli rimasti diventano spazi
     t = t.replace('\n', ' ')
@@ -418,7 +432,7 @@ def ricuci_testo(text: str) -> str:
 
 
 async def send_split_messages(chat_id, text):
-    text = ricuci_testo(text)
+    text = ricuci_testo(normalizza_flag(text))
     text = clean_dashes(text)
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
@@ -478,7 +492,7 @@ async def process_messages(sender_id, sender_info, debounce):
                         reply_text = await resp.text()
                         # Ricuci SUBITO: se la risposta arriva in streaming i flag possono
                         # essere spezzati ("[NOTIFICA_JAC\nK]") e i controlli sotto fallirebbero.
-                        reply_text = ricuci_testo(reply_text).strip()
+                        reply_text = ricuci_testo(normalizza_flag(reply_text)).strip()
                     except Exception:
                         reply_text = ""
                     if not reply_text:
@@ -570,16 +584,16 @@ async def process_messages(sender_id, sender_info, debounce):
                     # Regex tollerante a spazi/underscore/maiuscole: un match esatto su
                     # stringa lascerebbe passare qualsiasi piccola variazione.
                     FLAG_PATTERNS = {
-                        'NOTIFICA_JACK': re.compile(r'\[\s*NOTIFICA[_\s]?JACK\s*\]', re.I),
+                        'NOTIFICA_JACK': re.compile(r'\[\s*NOTIFICA[_\s]*JACK\s*\]', re.I),
                         'ESCALATION': re.compile(r'\[\s*ESCALATION\s*\]', re.I),
-                        'AGENT2': re.compile(r'\[\s*AGENT\s*2\s*\]', re.I),
-                        'STORICO_LEAD': re.compile(r'\[\s*STORICO[_\s]?LEAD\s*\]', re.I),
-                        'ALERT_CHIUSURA': re.compile(r'\[\s*ALERT[_\s]?CHIUSURA\s*\]', re.I),
-                        'ALERT_DEPOSITO': re.compile(r'\[\s*ALERT[_\s]?DEPOSITO\s*\]', re.I),
-                        'ALERT_VERIFICA_REFERRAL': re.compile(r'\[\s*ALERT[_\s]?VERIFICA[_\s]?REFERRAL\s*\]', re.I),
-                        'AUDIO_1': re.compile(r'\[\s*AUDIO[_\s]?1\s*\]', re.I),
-                        'AUDIO_2': re.compile(r'\[\s*AUDIO[_\s]?2\s*\]', re.I),
-                        'AUDIO_3': re.compile(r'\[\s*AUDIO[_\s]?3\s*\]', re.I),
+                        'AGENT2': re.compile(r'\[\s*AGENT[_\s]*2\s*\]', re.I),
+                        'STORICO_LEAD': re.compile(r'\[\s*STORICO[_\s]*LEAD\s*\]', re.I),
+                        'ALERT_CHIUSURA': re.compile(r'\[\s*ALERT[_\s]*CHIUSURA\s*\]', re.I),
+                        'ALERT_DEPOSITO': re.compile(r'\[\s*ALERT[_\s]*DEPOSITO\s*\]', re.I),
+                        'ALERT_VERIFICA_REFERRAL': re.compile(r'\[\s*ALERT[_\s]*VERIFICA[_\s]*REFERRAL\s*\]', re.I),
+                        'AUDIO_1': re.compile(r'\[\s*AUDIO[_\s]*1\s*\]', re.I),
+                        'AUDIO_2': re.compile(r'\[\s*AUDIO[_\s]*2\s*\]', re.I),
+                        'AUDIO_3': re.compile(r'\[\s*AUDIO[_\s]*3\s*\]', re.I),
                     }
                     flag_trovati = [nome for nome, pat in FLAG_PATTERNS.items() if pat.search(clean_reply)]
                     if flag_trovati:
