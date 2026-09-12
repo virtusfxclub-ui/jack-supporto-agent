@@ -52,16 +52,14 @@ def debounce_dinamico(testo_totale: str) -> int:
     t = (testo_totale or "").strip()
     n = len(t)
     domande = t.count("?")
-    if n <= 15:                      # "ok", "si", "va bene", "certo"
-        base = random.randint(20, 40)
-    elif n <= 80:                    # una frase
-        base = random.randint(40, 70)
+    if n <= 80:                      # "ok", "si", una frase
+        base = random.randint(20, 30)
     elif n <= 250:                   # un paragrafo
-        base = random.randint(65, 100)
+        base = random.randint(40, 60)
     else:                            # un papiro
-        base = random.randint(95, 140)
-    base += min(30, domande * 10)    # piu' domande, piu' "tempo per pensare"
-    return max(15, min(150, base))
+        base = random.randint(50, 70)
+    base += min(15, domande * 5)     # piu' domande, un po' piu' di "tempo per pensare"
+    return max(15, min(80, base))    # mai oltre 80s: sopra si aggiungono gia' i 20-40s di n8n
 
 
 # ultimo istante in cui il lead risultava "sta scrivendo" (da UpdateUserTyping). Serve al debounce:
@@ -498,6 +496,11 @@ async def send_split_messages(chat_id, text):
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not parts:
         return
+    # "letto" appena prima di iniziare a scrivere
+    try:
+        await client.send_read_acknowledge(chat_id)
+    except Exception as e:
+        print(f"[READ] Impossibile segnare come letto {chat_id}: {e}")
     for i, part in enumerate(parts):
         # indicatore "sta scrivendo": proporzionale alla lunghezza, mai oltre 8s
         typing_time = max(2.0, min(8.0, len(part) / 25.0))
@@ -806,11 +809,9 @@ async def handle_incoming(event):
         media_type = "text"
         debounce = DEBOUNCE_TEXT
 
-        # Segna il messaggio del lead come letto → il lead vede le spunte blu (comportamento umano)
-        try:
-            await client.send_read_acknowledge(sender_id, event.message)
-        except Exception as e:
-            print(f"[READ] Impossibile segnare come letto {sender_id}: {e}")
+        # NOTA: il "letto" NON si segna qui. Segnarlo subito e rispondere dopo un minuto e' il segnale
+        # "online, ha letto, non risponde" che raffredda il lead. Si segna in send_split_messages,
+        # un istante prima di "sta scrivendo": il lead vede letto -> sta scrivendo -> risposta, tutto insieme.
 
         # Notifica sul topic chat SOLO per il primo messaggio di un lead nuovo:
         # vedere ogni singola riga di ogni conversazione era pura saturazione.
