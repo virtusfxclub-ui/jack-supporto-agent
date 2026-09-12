@@ -458,6 +458,32 @@ def normalizza_flag(text: str) -> str:
     return re.sub(r'\[\s*([A-Za-z0-9_\s]{1,40}?)\s*\]', _fix, text)
 
 
+_RE_META = [
+    re.compile(r'\bstep\s*\d', re.I),
+    re.compile(r"^\s*(deve|devo|dovrei|dovrebbe|bisogna|quindi si procede|analisi|ragionamento|nota|note interne|ok,? (il|la) lead)\b", re.I),
+    re.compile(r"\b(il lead|la lead|del lead|al lead|l'agent|l’agent|il prompt|la regola|le regole|il flag|il flusso)\b", re.I),
+    re.compile(r'\[NOME\]', re.I),
+    re.compile(r'\b(ESCALATION|NOTIFICA_?JACK|AGENT_?2|AUDIO_?\d)\b(?![^\[]*\])', re.I),
+]
+
+
+def scarta_meta(text: str) -> str:
+    """Toglie i paragrafi 'meta': ragionamenti interni del modello finiti nell'output
+    ("Deve rispondere allo step 6: ..."). Seconda rete dopo n8n. Mai svuotare tutto."""
+    if not text or '\n' not in text:
+        # un solo paragrafo: se e' tutto meta, lo lascio (meglio di un silenzio) ma lo segnalo
+        if text and any(r.search(text) for r in _RE_META):
+            print(f"[META] paragrafo unico sospetto: {text[:80]}")
+        return text
+    paragrafi = re.split(r'\n\s*\n', text)
+    tenuti = [p for p in paragrafi if not any(r.search(p) for r in _RE_META)]
+    if not tenuti:
+        return text
+    if len(tenuti) != len(paragrafi):
+        print(f"[META] scartati {len(paragrafi) - len(tenuti)} paragrafi interni")
+    return "\n\n".join(tenuti)
+
+
 def ricuci_testo(text: str) -> str:
     """
     Ripara gli a capo spuri introdotti da una risposta in streaming.
@@ -565,7 +591,7 @@ async def process_messages(sender_id, sender_info, debounce):
                         reply_text = await resp.text()
                         # Ricuci SUBITO: se la risposta arriva in streaming i flag possono
                         # essere spezzati ("[NOTIFICA_JAC\nK]") e i controlli sotto fallirebbero.
-                        reply_text = ricuci_testo(normalizza_flag(reply_text)).strip()
+                        reply_text = scarta_meta(ricuci_testo(normalizza_flag(reply_text))).strip()
                     except Exception:
                         reply_text = ""
                     if not reply_text:
