@@ -74,7 +74,28 @@ pending_tasks = {}
 # --- paused_leads persistente su file ---
 # Prima viveva solo in RAM: ogni redeploy di Railway azzerava il set e i lead
 # in pausa tornavano a essere gestiti dall'agent senza che nessuno se ne accorgesse.
-PAUSED_LEADS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paused_leads.json")
+# Cartella dati persistente: il volume Railway (RAILWAY_VOLUME_MOUNT_PATH, es. /data) o DATA_DIR.
+# Senza volume si torna alla cartella del codice, come prima (i file spariscono a ogni deploy).
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or _CODE_DIR
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"[DATA_DIR] impossibile creare {DATA_DIR}: {_e}, uso la cartella del codice"); DATA_DIR = _CODE_DIR
+
+
+def _migra_file(nome: str):
+    """Se un file di stato esiste ancora accanto al codice e non nel volume, lo copia nel volume (una volta sola)."""
+    vecchio = os.path.join(_CODE_DIR, nome); nuovo = os.path.join(DATA_DIR, nome)
+    try:
+        if DATA_DIR != _CODE_DIR and os.path.exists(vecchio) and not os.path.exists(nuovo):
+            import shutil; shutil.copy2(vecchio, nuovo); print(f"[DATA_DIR] migrato {nome} in {DATA_DIR}")
+    except Exception as e:
+        print(f"[DATA_DIR] migrazione {nome} fallita: {e}")
+
+
+_migra_file("paused_leads.json"); _migra_file("lead_state.json")
+PAUSED_LEADS_FILE = os.path.join(DATA_DIR, "paused_leads.json")
 
 
 def _carica_paused_leads() -> set:
@@ -98,7 +119,7 @@ paused_leads = _carica_paused_leads()
 # --- stato lead persistente (v10) ---
 # rientri: {chat_id: timestamp_iso} lead usciti da Perso perche' hanno riscritto.
 # Il flusso follow-up n8n lo legge da /folder-status (campo `rientro`) e manda UN solo messaggio.
-LEAD_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_state.json")
+LEAD_STATE_FILE = os.path.join(DATA_DIR, "lead_state.json")
 
 
 def _carica_lead_state() -> dict:
@@ -1895,6 +1916,7 @@ async def main():
         print(f"📇 Cache entita' pronta: {n_dial} dialoghi")
     except Exception as e:
         print(f"[WARN] warm-up dialoghi fallito: {e}")
+    print(f"💾 Dati persistenti in: {DATA_DIR}{'' if DATA_DIR != _CODE_DIR else ' (NESSUN VOLUME: si perdono al deploy)'}")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
     print(f"🌙 Modalità notte attiva: {is_night_time()}")
