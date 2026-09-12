@@ -106,10 +106,10 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            d.setdefault("rientri", {}); d.setdefault("cache", {})
+            d.setdefault("rientri", {}); d.setdefault("cache", {}); d.setdefault("fu", {})
             return d
     except Exception:
-        return {"rientri": {}, "cache": {}}
+        return {"rientri": {}, "cache": {}, "fu": {}}
 
 
 def _salva_lead_state():
@@ -1075,19 +1075,86 @@ async def handle_control(event):
             f"⏸ Lead in pausa: {paused_list}\n"
             f"✅ Tutto operativo"
         )
+PROMPT_FOLLOWUP = """Sei Jack (Giacomo Pozzi) di Virtus FX Club. Stai scrivendo su Telegram a un lead che non risponde da {ore} ore.
+Scrivi UN messaggio di follow-up, massimo 2 righe, che riprende ESATTAMENTE dal punto in cui la conversazione si era fermata e chiude con una domanda concreta che fa avanzare.
+
+NUMERO DEL FOLLOW-UP: {n} di 3
+- 1: leggero, un promemoria naturale sul punto lasciato aperto
+- 2: riprendi il punto e proponi il passo concreto (se aveva detto un capitale: "ce li hai i [cifra]? ti giro il link")
+- 3: domanda secca e diretta: c'e' qualcosa che non ti ha convinto?
+LEAD CALDO: {caldo}. Se caldo (aveva detto il capitale o che si registrava), vai dritto: chiedi se procede e proponi di mandargli il link.
+
+REGOLE FERREE:
+- Usa il nome SOLO se il lead lo ha dichiarato lui nella chat (mai il nome del profilo Telegram). Se non c'e', nessun nome.
+- Niente numeri di rendimento, pips, percentuali, promesse di guadagno. Niente link. Niente riferimenti a broker diversi da AXI.
+- VIETATO: "fammi sapere", "dimmi pure", "resto a disposizione", "quando vuoi", "senza fretta", "in bocca al lupo".
+- Non ripetere una frase gia' scritta nella chat. Non ricominciare da capo, non ripresentarti.
+- Tono: calmo, diretto, umano, come un messaggio scritto al volo. Zero elenchi, zero markdown, al massimo un'emoji.
+- Se nello storico il lead ha detto "non mi interessa" in modo netto, scrivi solo: SKIP
+
+ULTIMI MESSAGGI DELLA CHAT:
+{chat}
+
+Rispondi SOLO con il testo del messaggio (o SKIP). Niente virgolette, niente spiegazioni."""
+
+
+async def genera_followup(chat_id: int, n: int, caldo: bool, ore: float) -> str:
+    """Genera il testo del follow-up dallo storico reale della chat. Ritorna "" se non va inviato."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    _, msgs = await read_chat_messages(chat_id, hours=720, limit=40)
+    if not msgs:
+        return ""
+    chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-16:])
+    prompt = PROMPT_FOLLOWUP.format(ore=int(ore), n=n, caldo="SI" if caldo else "NO", chat=chat_text)
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-5", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as r:
+                d = await r.json()
+                out = (d.get("content", [{}])[0].get("text") or "").strip().strip('"')
+    except Exception as e:
+        print(f"[FOLLOWUP] generazione fallita: {e}")
+        return ""
+    if not out or out.upper().startswith("SKIP"):
+        return ""
+    out = ricuci_testo(normalizza_flag(out))
+    out = re.sub(r'\[\s*[A-Z0-9_]+\s*\]', '', out).strip()   # nessun flag nei follow-up
+    return out[:500]
+
+
 async def handle_send_followup(request: web.Request) -> web.Response:
-    """POST /send-followup — manda messaggio follow-up come @jacksupporto"""
+    """
+    POST /send-followup
+    Body A (testo pronto): {"chat_id": "123", "message": "..."}
+    Body B (generato dallo storico): {"chat_id": "123", "fu_n": 1|2|3, "caldo": true|false, "ore": 30}
+    In entrambi i casi registra il follow-up in lead_state["fu"] (usato da /folder-status e dalla riconciliazione).
+    """
     try:
         body = await request.json()
         chat_id = body.get("chat_id") or body.get("chatId")
         message = body.get("message") or body.get("followupMsg") or body.get("text")
-        if not chat_id or not message:
-            return web.json_response({"ok": False, "error": "chat_id e message obbligatori"}, status=400)
+        fu_n = int(body.get("fu_n") or 0)
+        if not chat_id:
+            return web.json_response({"ok": False, "error": "chat_id obbligatorio"}, status=400)
         chat_id = int(chat_id)
-        print(f"[FOLLOWUP] Invio a {chat_id}: {message[:80]}")
-        await client.send_message(chat_id, message)
+        if not message and fu_n:
+            message = await genera_followup(chat_id, fu_n, bool(body.get("caldo")), float(body.get("ore") or 24))
+            if not message:
+                return web.json_response({"ok": True, "sent": False, "reason": "skip"})
+        if not message:
+            return web.json_response({"ok": False, "error": "message o fu_n obbligatori"}, status=400)
+        print(f"[FOLLOWUP] Invio FU{fu_n or '?'} a {chat_id}: {message[:80]}")
+        await send_split_messages(chat_id, message)
+        prev = lead_state.setdefault("fu", {}).get(str(chat_id), {})
+        lead_state["fu"][str(chat_id)] = {"n": fu_n or (prev.get("n", 0) + 1), "ts": datetime.now(pytz.UTC).isoformat(), "testo": message}
+        _salva_lead_state()
         print(f"[FOLLOWUP] Inviato a {chat_id}")
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "sent": True, "message": message})
     except Exception as e:
         print(f"[HTTP ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -1297,6 +1364,8 @@ async def _leggi_stato_cartelle(giorni_attivita: int = 45):
             "cartelle": cartelle,
             "cartella_attuale": _cartella_prioritaria(cartelle),
             "rientro": chat_id in lead_state.get("rientri", {}),
+            "fu_count": lead_state.get("fu", {}).get(chat_id, {}).get("n", 0),
+            "fu_last_iso": lead_state.get("fu", {}).get(chat_id, {}).get("ts", ""),
             "ultimo_msg": dialog.date.isoformat() if dialog.date else "",
         })
     return chats_data, folder_ids
@@ -1666,15 +1735,22 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
 
             last = msgs[-1]; last_ours = _is_our_sender(last["sender"]); ore = _ore_da(last["timestamp_iso"]) or 0
             fu = 0; lead_dopo_fu = False
+            stato_fu = lead_state.get("fu", {}).get(c["chat_id"], {})
+            testo_fu_salvato = _norm_txt(stato_fu.get("testo", ""))
             for m in msgs:
                 if _is_our_sender(m["sender"]):
                     k = _fu_index(m["text"])
+                    if not k and testo_fu_salvato and _norm_txt(m["text"]) == testo_fu_salvato:
+                        k = stato_fu.get("n", 0)
                     if k: fu, lead_dopo_fu = k, False
                 elif fu:
                     lead_dopo_fu = True
+            # se il lead ha risposto dopo l'ultimo FU, il ciclo riparte da zero
+            if lead_dopo_fu and c["chat_id"] in lead_state.get("fu", {}) and not dry_run:
+                lead_state["fu"].pop(c["chat_id"], None); _salva_lead_state()
             in_perso = "perso" in cart_norm
 
-            ultimo_e_fu = last_ours and _fu_index(last["text"]) > 0
+            ultimo_e_fu = last_ours and (_fu_index(last["text"]) > 0 or (testo_fu_salvato and _norm_txt(last["text"]) == testo_fu_salvato))
             if last_ours:
                 if ore < 12 and not ultimo_e_fu:
                     target, motivo = "Trattativa", f"ultimo nostro {ore:.0f}h fa"
