@@ -39,6 +39,31 @@ MAX_HISTORY_MESSAGES = 150
 ITALY_TZ = pytz.timezone("Europe/Rome")
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 pending_messages = {}
+import random
+
+
+def debounce_dinamico(testo_totale: str) -> int:
+    """
+    Attesa prima di rispondere, in base a quanto ha scritto il lead (tutti i messaggi accumulati).
+    Un "ok" non merita un minuto di silenzio; un messaggio lungo con domande merita di piu'.
+    A questi secondi si sommano ~20-40s di elaborazione n8n: il lead vede la risposta dopo debounce + quella latenza.
+    Sempre con una componente casuale: mai lo stesso tempo due volte.
+    """
+    t = (testo_totale or "").strip()
+    n = len(t)
+    domande = t.count("?")
+    if n <= 15:                      # "ok", "si", "va bene", "certo"
+        base = random.randint(20, 40)
+    elif n <= 80:                    # una frase
+        base = random.randint(40, 70)
+    elif n <= 250:                   # un paragrafo
+        base = random.randint(65, 100)
+    else:                            # un papiro
+        base = random.randint(95, 140)
+    base += min(30, domande * 10)    # piu' domande, piu' "tempo per pensare"
+    return max(15, min(150, base))
+
+
 # ultimo istante in cui il lead risultava "sta scrivendo" (da UpdateUserTyping). Serve al debounce:
 # se il lead sta ancora digitando dopo i 60s, aspettiamo che smetta prima di rispondere a tutto insieme.
 last_typing = {}
@@ -453,6 +478,13 @@ async def send_split_messages(chat_id, text):
     if not parts:
         return
     for i, part in enumerate(parts):
+        # indicatore "sta scrivendo": proporzionale alla lunghezza, mai oltre 8s
+        typing_time = max(2.0, min(8.0, len(part) / 25.0))
+        try:
+            async with client.action(chat_id, 'typing'):
+                await asyncio.sleep(typing_time)
+        except Exception:
+            await asyncio.sleep(typing_time)
         await client.send_message(chat_id, part)
         # Traccia questo messaggio come inviato dall'agent
         if chat_id not in agent_messages:
@@ -462,13 +494,8 @@ async def send_split_messages(chat_id, text):
         if len(agent_messages[chat_id]) > 200:
             agent_messages[chat_id] = agent_messages[chat_id][-200:]
         if i < len(parts) - 1:
-            if len(part) > 120:
-                delay = 7.0
-            elif len(part) > 60:
-                delay = 5.0
-            else:
-                delay = 3.0
-            await asyncio.sleep(delay)
+            # pausa "di lettura" tra un messaggio e l'altro (il typing del prossimo si aggiunge)
+            await asyncio.sleep(random.uniform(1.5, 4.0))
 async def process_messages(sender_id, sender_info, debounce):
     await asyncio.sleep(debounce)
     # Se il lead sta ancora scrivendo, aspetto che smetta (max TYPING_MAX_EXTRA): cosi' rispondo a tutto in una volta
@@ -877,6 +904,10 @@ async def handle_incoming(event):
             "text": message_text,
             "media_type": media_type
         })
+        if media_type == "text":
+            # tutti i messaggi accumulati finora: piu' scrive, piu' aspettiamo (entro i limiti)
+            testo_totale = " ".join(m["text"] for m in pending_messages[sender_id] if m.get("media_type") == "text")
+            debounce = debounce_dinamico(testo_totale)
         sender_info = {
             "full_name": full_name,
             "username": sender_username,
@@ -1491,7 +1522,7 @@ async def handle_get_chats(request: web.Request) -> web.Response:
 # LEAD (tutto il resto):
 #   - nessun messaggio                     -> skip
 #   - ultimo nostro, < 12h                 -> Trattativa
-#   - ultimo nostro, FU3 inviato e >= 72h  -> Perso
+#   - ultimo nostro, FU3 inviato e >= 7gg  -> Perso (allineato al flusso follow-up n8n: 24h / 3gg / 7gg / 7gg)
 #   - ultimo nostro, >= 12h                -> Followup
 #   - ultimo del lead, < 12h               -> Trattativa (l'agent sta rispondendo)
 #   - ultimo del lead, >= 12h              -> Claude decide TRATTATIVA / RINVIO / PERSO
@@ -1647,8 +1678,8 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             if last_ours:
                 if ore < 12 and not ultimo_e_fu:
                     target, motivo = "Trattativa", f"ultimo nostro {ore:.0f}h fa"
-                elif fu >= 3 and ore >= 72 and not lead_dopo_fu:
-                    target, motivo = "Perso", "FU3 inviato, nessuna risposta da 72h"
+                elif fu >= 3 and ore >= 168 and not lead_dopo_fu:
+                    target, motivo = "Perso", "FU3 inviato, nessuna risposta da 7 giorni"
                 elif in_perso and fu >= 3:
                     report["skip"]["gia_ok"] += 1; continue
                 else:
