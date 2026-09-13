@@ -976,7 +976,7 @@ async def handle_incoming(event):
                 if not desc:
                     desc = "caso 9: screenshot non leggibile"
                 message_text = f"[SCREENSHOT: {desc}]" + (f" Didascalia: {message_text}" if message_text else "")
-                media_type = "text"
+                media_type = "screenshot"   # debounce corto: chi manda uno screen aspetta una risposta, non un minuto
                 if reg_get(sender_id).get("stato") == "link_inviato":
                     reg_set(sender_id, stato="in_registrazione")
             elif isinstance(event.message.media, MessageMediaPhoto):
@@ -1071,7 +1071,9 @@ async def handle_incoming(event):
             "text": message_text,
             "media_type": media_type
         })
-        if media_type == "text":
+        if media_type == "screenshot":
+            debounce = random.randint(6, 10)
+        elif media_type == "text":
             # tutti i messaggi accumulati finora: piu' scrive, piu' aspettiamo (entro i limiti)
             testo_totale = " ".join(m["text"] for m in pending_messages[sender_id] if m.get("media_type") == "text")
             debounce = debounce_dinamico(testo_totale)
@@ -1971,6 +1973,7 @@ Descrivi in UNA riga, in italiano, cosa mostra, scegliendo SOLO tra questi casi:
 8) "mail di chiusura inviata" (screenshot di una mail a success@axi.com)
 9) "altro" (descrivi in poche parole; se e' un sito diverso da AXI dillo)
 10) "deposito completato" (ricevuta, "pagamento riuscito", saldo accreditato, cifra depositata visibile)
+11) "form di registrazione" (indica QUALE pagina: prima pagina con le domande "cosa ti interessa", piattaforma/tipo conto, indirizzo, situazione lavorativa, finanze/risparmi, elenco documenti del contratto, consensi/captcha, mail e password, verifica ID). Riporta le opzioni visibili in poche parole.
 Formato: "caso N: descrizione". Non aggiungere consigli. Se vedi dati sensibili (numero carta, documento, password) NON riportarli, scrivi solo "dati sensibili in vista"."""
 
 
