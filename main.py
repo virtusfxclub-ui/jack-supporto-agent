@@ -1962,6 +1962,7 @@ Descrivi in UNA riga, in italiano, cosa mostra, scegliendo SOLO tra questi casi:
 7) "menu laterale / impostazioni" (elenca le voci visibili)
 8) "mail di chiusura inviata" (screenshot di una mail a success@axi.com)
 9) "altro" (descrivi in poche parole; se e' un sito diverso da AXI dillo)
+10) "deposito completato" (ricevuta, "pagamento riuscito", saldo accreditato, cifra depositata visibile)
 Formato: "caso N: descrizione". Non aggiungere consigli. Se vedi dati sensibili (numero carta, documento, password) NON riportarli, scrivi solo "dati sensibili in vista"."""
 
 
