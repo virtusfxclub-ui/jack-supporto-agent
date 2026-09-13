@@ -1675,10 +1675,13 @@ async def invia_template(chat_id: int, key: str) -> bool:
     righe = testo.splitlines()
     if righe and righe[-1].strip().startswith("#"):
         testo = "\n".join(righe[:-1]).rstrip()
+    # Solo documenti e foto si riallegano. L'anteprima di un link (MessageMediaWebPage) NON e' un file:
+    # si lascia che Telegram la ricrei dal link nel testo.
+    allegato = msg.media if isinstance(msg.media, (MessageMediaDocument, MessageMediaPhoto)) else None
     try:
-        async with client.action(chat_id, 'document' if msg.media else 'typing'):
+        async with client.action(chat_id, 'document' if allegato else 'typing'):
             await asyncio.sleep(random.uniform(2, 4))
-        await client.send_message(chat_id, testo, formatting_entities=msg.entities, file=msg.media, link_preview=True)
+        await client.send_message(chat_id, testo, formatting_entities=msg.entities, file=allegato, link_preview=True)
         agent_messages.setdefault(chat_id, []).append(testo.strip())
         r = reg_get(chat_id); docs = list(r.get("docs", []))
         if key not in docs: docs.append(key)
