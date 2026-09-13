@@ -114,6 +114,35 @@ def _salva_paused_leads():
 
 paused_leads = _carica_paused_leads()
 
+# ═══════════════════════════════════════════════════════════════════════
+# BLOCCO E1 — REGISTRAZIONE ACCOMPAGNATA (attivo SOLO per gli id in E1_TEST_IDS, o per tutti con E1_ALL=true)
+# ═══════════════════════════════════════════════════════════════════════
+E1_ALL = os.environ.get("E1_ALL", "false").lower() == "true"
+E1_TEST_IDS = {int(x) for x in os.environ.get("E1_TEST_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
+STATI_REG = ("link_inviato", "in_registrazione", "registrato", "deposito_dichiarato", "whitelist", "ripensamento")
+TEMPLATE_KEYS = ("link_registrazione", "tutorial_registrazione", "tutorial_mt5", "chiusura", "benvenuto")
+templates_salvati = {}   # key -> telethon Message dai "Messaggi salvati"
+
+
+def e1_attivo(chat_id) -> bool:
+    try:
+        return E1_ALL or int(chat_id) in E1_TEST_IDS
+    except Exception:
+        return False
+
+
+def reg_get(chat_id) -> dict:
+    return lead_state.setdefault("reg", {}).get(str(chat_id), {})
+
+
+def reg_set(chat_id, **campi):
+    r = lead_state.setdefault("reg", {}).setdefault(str(chat_id), {})
+    r.update(campi); r["ts"] = datetime.now(pytz.UTC).isoformat()
+    _salva_lead_state()
+    print(f"[STATO] {chat_id}: {r.get('stato')} {campi}")
+    return r
+
+
 # --- stato lead persistente (v10) ---
 # rientri: {chat_id: timestamp_iso} lead usciti da Perso perche' hanno riscritto.
 # Il flusso follow-up n8n lo legge da /folder-status (campo `rientro`) e manda UN solo messaggio.
@@ -125,10 +154,10 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            d.setdefault("rientri", {}); d.setdefault("cache", {}); d.setdefault("fu", {})
+            for k in ("rientri", "cache", "fu", "reg"): d.setdefault(k, {})
             return d
     except Exception:
-        return {"rientri": {}, "cache": {}, "fu": {}}
+        return {"rientri": {}, "cache": {}, "fu": {}, "reg": {}}
 
 
 def _salva_lead_state():
@@ -555,6 +584,8 @@ async def process_messages(sender_id, sender_info, debounce):
         await asyncio.sleep(3); extra += 3
     if extra:
         print(f"[DEBOUNCE] {sender_info.get('full_name')} stava scrivendo: atteso {extra}s in piu'")
+    if e1_attivo(sender_id) and reg_get(sender_id).get("stato") == "link_inviato":
+        reg_set(sender_id, stato="in_registrazione")
     if sender_id in paused_leads:
         print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
         pending_messages.pop(sender_id, None)
@@ -576,6 +607,10 @@ async def process_messages(sender_id, sender_info, debounce):
         "sender_name": sender_info["first_name"],
         "chat_id": str(sender_id),
         "message_text": combined_text,
+        "e1": e1_attivo(sender_id),
+        "stato_reg": reg_get(sender_id).get("stato") or "",
+        "scelta": reg_get(sender_id).get("scelta") or "",
+        "notte": is_night_time(),
         "media_type": media_type,
         "telegram_history": chat_history
     }
@@ -603,6 +638,31 @@ async def process_messages(sender_id, sender_info, debounce):
                         _salva_paused_leads()
                         print(f"[BLOCKED] {sender_info['full_name']} bloccato")
                         return
+                    # E1 — INNESCO: Agent 1 chiude con "ti giro il link" + ESCALATION. Se E1 e' attivo per questa chat
+                    # e non e' gia' in registrazione, invece della pausa: link + tutorial + "Dimmi pure quando parti!"
+                    if (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
+                            and reg_get(sender_id).get("stato") not in STATI_REG
+                            and re.search(r'\blink\b', reply_text, re.I)):
+                        bridge = reply_text[7:].strip()
+                        bridge = re.sub(r'\[\s*[A-Z0-9_]+\s*\]', '', bridge).strip()
+                        scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
+                        await send_split_messages(sender_id, bridge or "Ok, ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso?")
+                        ok1 = await invia_template(sender_id, "link_registrazione")
+                        ok2 = await invia_template(sender_id, "tutorial_registrazione")
+                        if ok1:
+                            await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
+                            reg_set(sender_id, stato="link_inviato", scelta=scelta, orario_dichiarato="", tocchi=0)
+                            asyncio.create_task(notify_jack(
+                                f"🔗 LINK INVIATO (E1)\n\n👤 {sender_info['full_name']}\n\nL'agent lo segue nella registrazione. Tu entri a deposito fatto.\n👉 {link_chat(sender_info, sender_id)}",
+                                topic="alert"))
+                        else:
+                            # template mancante: comportamento classico, pausa + escalation
+                            paused_leads.add(sender_id); _salva_paused_leads()
+                            asyncio.create_task(notify_jack(
+                                f"⚫ ESCALATION (E1: template link non trovato nei messaggi salvati)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}",
+                                topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
+                        return
+
                     # Gestione PAUSE — escalation
                     if reply_text.startswith("[PAUSE]"):
                         clean_reply = reply_text[7:].strip()
@@ -642,6 +702,34 @@ async def process_messages(sender_id, sender_info, debounce):
 
                     _link = link_chat(sender_info, sender_id)
 
+                    # ---- E1: documenti richiesti dall'agent ([DOC:chiave]) ----
+                    doc_da_inviare = []
+                    for m_doc in re.finditer(r'\[\s*DOC\s*:\s*([a-z_]+)\s*\]', clean_reply, re.I):
+                        k = m_doc.group(1).lower()
+                        if k in TEMPLATE_KEYS and k != "benvenuto" and k not in doc_da_inviare:
+                            doc_da_inviare.append(k)
+                    clean_reply = re.sub(r'\[\s*DOC\s*:\s*[a-z_]+\s*\]', '', clean_reply, flags=re.I).strip()
+                    clean_reply = re.sub(r'\[\s*ORARIO\s*:[^\]]*\]', '', clean_reply, flags=re.I).strip()
+                    if not e1_attivo(sender_id):
+                        doc_da_inviare = []
+                    if "link_registrazione" in doc_da_inviare and reg_get(sender_id).get("stato") == "whitelist":
+                        doc_da_inviare.remove("link_registrazione")   # regola dura: mai il link a chi e' in whitelist
+
+                    # ---- E1: registrato (nessuna pausa, l'agent continua ad accompagnare) ----
+                    if re.search(r'\[\s*ALERT[_\s]*REGISTRATO\s*\]', clean_reply, re.I):
+                        clean_reply = re.sub(r'\[\s*ALERT[_\s]*REGISTRATO\s*\]', '', clean_reply, flags=re.I).strip()
+                        reg_set(sender_id, stato="registrato")
+                        asyncio.create_task(notify_jack(
+                            f"📝 REGISTRATO (E1)\n\n👤 {sender_info['full_name']}\n\nDice di essersi registrato: verifica in dashboard con nome/mail che trovi in chat. L'agent continua a seguirlo fino al deposito.\n👉 {link_chat(sender_info, sender_id)}",
+                            topic="alert"))
+                    if re.search(r'\[\s*ALERT[_\s]*RIPENSAMENTO\s*\]', clean_reply, re.I):
+                        clean_reply = re.sub(r'\[\s*ALERT[_\s]*RIPENSAMENTO\s*\]', '', clean_reply, flags=re.I).strip()
+                        reg_set(sender_id, stato="ripensamento")
+                        paused_leads.add(sender_id); _salva_paused_leads()
+                        asyncio.create_task(notify_jack(
+                            f"🤔 RIPENSAMENTO (E1)\n\n👤 {sender_info['full_name']}\n\nDopo il link ha frenato. L'agent ha fatto una domanda leggera e si e' fermato.\n👉 {link_chat(sender_info, sender_id)}",
+                            topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
+
                     # Alert dedicato: verifica cambio referral su conto AXI mai depositato
                     if '[ALERT_VERIFICA_REFERRAL]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_VERIFICA_REFERRAL]', '').strip()
@@ -657,6 +745,8 @@ async def process_messages(sender_id, sender_info, debounce):
                     # Alert dedicato: serve la procedura di chiusura conto AXI
                     if '[ALERT_CHIUSURA]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_CHIUSURA]', '').strip()
+                        if e1_attivo(sender_id):
+                            reg_set(sender_id, stato="whitelist"); paused_leads.add(sender_id); _salva_paused_leads()
                         asyncio.create_task(notify_jack(
                             f"🟠 CHIUSURA CONTO AXI\n\n"
                             f"👤 {sender_info['full_name']}\n\n"
@@ -669,6 +759,10 @@ async def process_messages(sender_id, sender_info, debounce):
                     # Alert dedicato: il lead dice di aver depositato -> serve accesso VIP
                     if '[ALERT_DEPOSITO]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_DEPOSITO]', '').strip()
+                        if e1_attivo(sender_id):
+                            reg_set(sender_id, stato="deposito_dichiarato"); paused_leads.add(sender_id); _salva_paused_leads()
+                            if "benvenuto" not in reg_get(sender_id).get("docs", []):
+                                doc_da_inviare.append("benvenuto")   # unico caso in cui l'agent manda il link VIP
                         asyncio.create_task(notify_jack(
                             f"🟢 DEPOSITO FATTO\n\n"
                             f"👤 {sender_info['full_name']}\n\n"
@@ -729,11 +823,22 @@ async def process_messages(sender_id, sender_info, debounce):
                                 buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]
                             ))
 
-                    if not clean_reply.strip() and not audio_key_to_send:
+                    if not clean_reply.strip() and not audio_key_to_send and not doc_da_inviare:
                         print(f"[MSG OUT] Nessun testo da inviare a {sender_id}")
-                    else:
+                    elif clean_reply.strip():
                         await send_split_messages(sender_id, clean_reply)
                         print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
+
+                    # E1: documenti dai messaggi salvati, dopo il testo
+                    for k in doc_da_inviare:
+                        await asyncio.sleep(random.uniform(1.5, 3.0))
+                        ok = await invia_template(sender_id, k)
+                        if ok and k == "link_registrazione" and reg_get(sender_id).get("stato") not in STATI_REG:
+                            reg_set(sender_id, stato="link_inviato", tocchi=0)
+                    # E1: orario dichiarato dal lead (l'agent lo scrive come [ORARIO: ...])
+                    m_or = re.search(r'\[\s*ORARIO\s*:\s*([^\]]{2,40})\]', reply_text, re.I)
+                    if m_or and e1_attivo(sender_id):
+                        reg_set(sender_id, orario_dichiarato=m_or.group(1).strip())
 
                     if audio_key_to_send:
                         try:
@@ -860,7 +965,16 @@ async def handle_incoming(event):
         except Exception as e:
             print(f"[NOTIFY] Errore notifica nuovo messaggio: {e}")
         if event.message.media:
-            if isinstance(event.message.media, MessageMediaPhoto):
+            if isinstance(event.message.media, MessageMediaPhoto) and e1_attivo(sender_id) and reg_get(sender_id).get("stato") in STATI_REG:
+                # E1: lo screenshot viene descritto e passato all'agent come testo. L'agent risponde solo ai casi noti.
+                desc = await descrivi_screenshot(sender_id, event.message)
+                if not desc:
+                    desc = "caso 9: screenshot non leggibile"
+                message_text = f"[SCREENSHOT: {desc}]" + (f" Didascalia: {message_text}" if message_text else "")
+                media_type = "text"
+                if reg_get(sender_id).get("stato") == "link_inviato":
+                    reg_set(sender_id, stato="in_registrazione")
+            elif isinstance(event.message.media, MessageMediaPhoto):
                 print(f"[IMAGE] Immagine da {full_name} — metto in pausa e notifico Jack")
                 paused_leads.add(sender_id)
                 caption = f" — didascalia: \"{message_text}\"" if message_text else ""
@@ -1412,6 +1526,7 @@ async def _leggi_stato_cartelle(giorni_attivita: int = 45):
             "cartelle": cartelle,
             "cartella_attuale": _cartella_prioritaria(cartelle),
             "rientro": chat_id in lead_state.get("rientri", {}),
+            "stato_reg": lead_state.get("reg", {}).get(chat_id, {}).get("stato") or "",
             "fu_count": lead_state.get("fu", {}).get(chat_id, {}).get("n", 0),
             "fu_last_iso": lead_state.get("fu", {}).get(chat_id, {}).get("ts", ""),
             "ultimo_msg": dialog.date.isoformat() if dialog.date else "",
@@ -1421,7 +1536,7 @@ async def _leggi_stato_cartelle(giorni_attivita: int = 45):
 
 # Ordine di priorita' quando una chat sta in piu' cartelle: la prima che matcha vince.
 # Serve solo per il campo legacy `cartella_attuale`; la logica v10 usa la lista completa.
-PRIORITA_CARTELLE = ["attesa", "vip", "contattare", "bruciati", "transfer", "followup", "perso", "trattativa"]
+PRIORITA_CARTELLE = ["attesa", "vip", "contattare", "bruciati", "transfer", "registraz", "followup", "perso", "trattativa"]
 
 
 def _cartella_prioritaria(cartelle):
@@ -1462,7 +1577,7 @@ async def move_chat_to_folder(chat_id: int, target_folder_name: str, exclusive: 
         entity = await _get_entity_robusto(chat_id)
         input_peer = await client.get_input_entity(entity)
         filters = await get_dialog_filters()
-        AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso"]
+        AUTO_MANAGED_FOLDERS = ["Trattativa", "Followup", "Perso", "Registraz"]
 
         target_filter = None
         for f in filters:
@@ -1525,6 +1640,141 @@ async def _get_entity_robusto(chat_id: int):
         return await client.get_entity(chat_id)
 
 
+async def carica_template_salvati() -> dict:
+    """Legge i 'Messaggi salvati' (chat con se stessi). Ogni messaggio che finisce con una riga '#chiave'
+    diventa un template inviabile con [DOC:chiave]. L'etichetta viene tolta prima dell'invio."""
+    trovati = {}
+    try:
+        async for msg in client.iter_messages('me', limit=300):
+            testo = (msg.message or "").rstrip()
+            righe = testo.splitlines()
+            if not righe:
+                continue
+            m = re.fullmatch(r'#\s*([a-z0-9_]+)\s*', righe[-1].strip().lower())
+            if m and m.group(1) in TEMPLATE_KEYS and m.group(1) not in trovati:
+                trovati[m.group(1)] = msg
+    except Exception as e:
+        print(f"[TEMPLATE] lettura messaggi salvati fallita: {e}")
+    templates_salvati.clear(); templates_salvati.update(trovati)
+    print(f"[TEMPLATE] caricati: {sorted(trovati)} (mancanti: {sorted(set(TEMPLATE_KEYS) - set(trovati))})")
+    return {k: (v.message or "")[:60] for k, v in trovati.items()}
+
+
+async def invia_template(chat_id: int, key: str) -> bool:
+    """Invia al lead una COPIA (non un inoltro) del messaggio salvato: testo, link cliccabili, PDF."""
+    msg = templates_salvati.get(key)
+    if msg is None:
+        await carica_template_salvati(); msg = templates_salvati.get(key)
+    if msg is None:
+        print(f"[TEMPLATE] '{key}' non trovato nei messaggi salvati"); return False
+    testo = (msg.message or "").rstrip()
+    righe = testo.splitlines()
+    if righe and righe[-1].strip().startswith("#"):
+        testo = "\n".join(righe[:-1]).rstrip()
+    try:
+        async with client.action(chat_id, 'document' if msg.media else 'typing'):
+            await asyncio.sleep(random.uniform(2, 4))
+        await client.send_message(chat_id, testo, formatting_entities=msg.entities, file=msg.media, link_preview=True)
+        agent_messages.setdefault(chat_id, []).append(testo.strip())
+        r = reg_get(chat_id); docs = list(r.get("docs", []))
+        if key not in docs: docs.append(key)
+        reg_set(chat_id, docs=docs)
+        print(f"[TEMPLATE] inviato '{key}' a {chat_id}")
+        return True
+    except Exception as e:
+        print(f"[TEMPLATE] invio '{key}' a {chat_id} fallito: {e}"); return False
+
+
+PROMPT_FU_REG = """Sei Jack di Virtus FX Club. Stai accompagnando un lead nella registrazione su AXI: ha gia' detto si', ha ricevuto il link e il tutorial, e non scrive da {ore} ore.
+STATO: {stato} (link_inviato = ha il link ma non ha ancora scritto; in_registrazione = sta facendo la procedura; registrato = conto aperto, manca il deposito)
+TOCCO NUMERO: {n} (1 = offerta di aiuto leggera, tipo "se ti blocchi da qualche parte mandami uno screen, ci sono io"; 2 = "sei riuscito?"; 3 = "novita'? ti tengo il posto"; 4 = ultimo, "dimmi se sei riuscito cosi' ti colleghiamo e non perdi l'operativita'")
+ORARIO CHE IL LEAD AVEVA DICHIARATO: {orario} (se ha detto un momento preciso e quel momento non e' ancora passato rispetto a ORA, rispondi SKIP)
+ORA ATTUALE (Italia): {ora}
+
+Scrivi UN messaggio, massimo 2 righe, nello stile di Jack: corto, caldo, un punto esclamativo va bene, al massimo un'emoji (💪🤝). Riprendi dal punto esatto in cui il lead si era fermato (se aveva un problema con la carta, chiedi di quello; se stava attivando il bonus, di quello).
+REGOLE: usa il nome SOLO se il lead l'ha dichiarato lui. Niente pressione, niente urgenza, niente capitale, niente numeri, niente link. VIETATO "fammi sapere", "dimmi pure", "senza fretta". Non ripetere una frase gia' scritta nella chat. Se il lead ha detto chiaramente di non voler procedere: SKIP.
+
+ULTIMI MESSAGGI:
+{chat}
+
+Rispondi SOLO con il testo (o SKIP)."""
+
+SOGLIE_FU_REG = {  # ore dall'ultimo NOSTRO messaggio, per tocco 1..4
+    "link_inviato": [2, 12, 24, 48], "in_registrazione": [2, 12, 24, 48], "registrato": [6, 12, 48, 96],
+}
+
+
+async def followup_registrazione(dry_run: bool = False) -> dict:
+    """Un giro di follow-up di accompagnamento per i lead E1. Chiamato ogni ora da n8n (9-23)."""
+    now_it = datetime.now(ITALY_TZ); h = now_it.hour
+    report = {"inviati": [], "skip": {}, "alert": []}
+    if h < 9 or h >= 23:
+        report["skip"]["fuori_orario"] = True; return report
+    finestra_piena = h in (9, 10, 18, 19)
+    for cid, r in list(lead_state.get("reg", {}).items()):
+        stato = r.get("stato")
+        if stato not in SOGLIE_FU_REG or int(cid) in paused_leads or not e1_attivo(cid):
+            continue
+        tocchi = int(r.get("tocchi", 0))
+        if tocchi >= 4:
+            continue
+        if tocchi > 0 and not finestra_piena:
+            report["skip"][cid] = "fuori finestra"; continue
+        try:
+            _, msgs = await read_chat_messages(int(cid), hours=24 * 14, limit=40)
+        except Exception as e:
+            report["skip"][cid] = f"lettura fallita {e}"; continue
+        if not msgs or not _is_our_sender(msgs[-1]["sender"]):
+            continue   # il lead ha scritto per ultimo: risponde l'agent, non il follow-up
+        ore = _ore_da(msgs[-1]["timestamp_iso"]) or 0
+        if ore < SOGLIE_FU_REG[stato][tocchi]:
+            continue
+        if dry_run:
+            report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "dry_run": True}); continue
+        chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-14:])
+        prompt = PROMPT_FU_REG.format(ore=int(ore), stato=stato, n=tocchi + 1, orario=r.get("orario_dichiarato") or "nessuno",
+                                      ora=now_it.strftime("%A %H:%M"), chat=chat_text)
+        testo = ""
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-sonnet-5", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
+                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    d = await resp.json(); testo = (d.get("content", [{}])[0].get("text") or "").strip().strip('"')
+        except Exception as e:
+            report["skip"][cid] = f"generazione fallita {e}"; continue
+        if not testo or testo.upper().startswith("SKIP"):
+            report["skip"][cid] = "SKIP dal modello"; continue
+        testo = scarta_meta(ricuci_testo(normalizza_flag(testo)))
+        testo = re.sub(r'\[\s*[A-Z0-9_:]+\s*\]', '', testo).strip()[:400]
+        await send_split_messages(int(cid), testo)
+        reg_set(cid, tocchi=tocchi + 1)
+        report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "testo": testo})
+        if tocchi + 1 >= 4:
+            try:
+                await notify_jack(f"⏳ REGISTRAZIONE FERMA (E1)\n\nChat {cid}: stato {stato}, 4 tocchi senza risposta. Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
+                report["alert"].append(cid)
+            except Exception:
+                pass
+    print(f"[FU-REG] inviati={len(report['inviati'])} skip={len(report['skip'])}")
+    return report
+
+
+async def handle_followup_registrazione(request: web.Request) -> web.Response:
+    """POST/GET /registrazione-followup?dry_run=1"""
+    dry = str(request.rel_url.query.get("dry_run", "0")).lower() in ("1", "true")
+    try:
+        return web.json_response({"ok": True, **(await followup_registrazione(dry_run=dry))})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def handle_reload_templates(request: web.Request) -> web.Response:
+    """GET /reload-templates — rilegge i messaggi salvati (dopo che Jack li ha modificati)."""
+    return web.json_response({"ok": True, "templates": await carica_template_salvati()})
+
+
 def _is_our_sender(sender: str) -> bool:
     return sender in ("Agent", "Jack (manuale)")
 
@@ -1567,7 +1817,8 @@ async def handle_get_single_chat(request: web.Request) -> web.Response:
         entity, messages = await read_chat_messages(chat_id, hours, limit)
         full_name = f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip()
         return web.json_response({"ok": True, "chat_id": str(chat_id), "nome": full_name, "messaggi": messages,
-                                  "rientro": str(chat_id) in lead_state.get("rientri", {})})
+                                  "rientro": str(chat_id) in lead_state.get("rientri", {}),
+                                  "e1": e1_attivo(chat_id), "stato_reg": reg_get(chat_id).get("stato") or ""})
     except Exception as e:
         print(f"[GET-SINGLE-CHAT ERROR] {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -1661,7 +1912,7 @@ FU_RIENTRO_TESTO = "Ho visto che sei tornato a scrivere"  # prefisso del messagg
 MODELLO_CLASSIFICA = os.environ.get("MODELLO_CLASSIFICA", "claude-haiku-4-5-20251001")
 
 CARTELLE_CLIENTI = {"attesa", "vip", "contattare", "bruciati"}
-CARTELLE_LEAD_AUTO = {"trattativa", "followup", "perso"}
+CARTELLE_LEAD_AUTO = {"trattativa", "followup", "perso", "registraz"}
 PALLINO_CARTELLA = {"\U0001F7E1": "Attesa", "\U0001F7E2": "VIP", "\U0001F7E0": "Contattare", "\U0001F534": "Bruciati"}
 
 PROMPT_CLASSIFICA_LEAD = """Analizza questa conversazione Telegram tra Jack (venditore, community copy trading) e un lead. L'ultimo messaggio e' del lead e non ha ancora ricevuto risposta da ore.
@@ -1700,6 +1951,46 @@ def _fu_index(testo: str):
     return 0
 
 
+PROMPT_SCREENSHOT = """Questo screenshot arriva da una persona che si sta registrando o sta depositando sul broker AXI (portale my.axiconnect.online, app AXI o MetaTrader 5).
+Descrivi in UNA riga, in italiano, cosa mostra, scegliendo SOLO tra questi casi:
+1) "scelta tipo conto" (indica il tipo selezionato: Standard/Pro/altro)
+2) "valuta e leva" (indica valuta e leva selezionate)
+3) "codice promozionale / premi" (indica se e' visibile AXI50 o AXI100)
+4) "deposito / metodo di pagamento" (indica metodo e cifra se visibili)
+5) "errore carta o pagamento rifiutato" (riporta il testo dell'errore)
+6) "conto creato / dashboard" (indica numero conto o stato 'in attesa di revisione' se visibili)
+7) "menu laterale / impostazioni" (elenca le voci visibili)
+8) "mail di chiusura inviata" (screenshot di una mail a success@axi.com)
+9) "altro" (descrivi in poche parole; se e' un sito diverso da AXI dillo)
+Formato: "caso N: descrizione". Non aggiungere consigli. Se vedi dati sensibili (numero carta, documento, password) NON riportarli, scrivi solo "dati sensibili in vista"."""
+
+
+async def descrivi_screenshot(chat_id: int, message) -> str:
+    """Scarica la foto e la fa descrivere a Claude. Ritorna il testo da dare all'agent, o "" se fallisce."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        import base64
+        raw = await client.download_media(message, bytes)
+        if not raw:
+            return ""
+        b64 = base64.b64encode(raw).decode()
+        mime = "image/jpeg"
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-5", "max_tokens": 150, "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                    {"type": "text", "text": PROMPT_SCREENSHOT}]}]},
+                timeout=aiohttp.ClientTimeout(total=60)) as r:
+                d = await r.json()
+                out = (d.get("content", [{}])[0].get("text") or "").strip()
+        print(f"[SCREENSHOT] {chat_id}: {out[:120]}")
+        return out
+    except Exception as e:
+        print(f"[SCREENSHOT] errore {chat_id}: {e}"); return ""
+
+
 async def _claude_classifica_lead(chat_text: str) -> str:
     if not ANTHROPIC_API_KEY:
         return "TRATTATIVA"
@@ -1733,7 +2024,8 @@ def _ore_da(ts_iso: str):
 
 
 async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: int = 45) -> dict:
-    chats, _ = await _leggi_stato_cartelle(giorni)
+    chats, folder_ids = await _leggi_stato_cartelle(giorni)
+    folder_ids_norm = {_norm_folder(k) for k in folder_ids}
     report = {"dry_run": dry_run, "totale_chat": len(chats), "movimenti": [], "anomalie": [], "claude_chiamate": 0,
               "skip": {"cliente": 0, "manuale": 0, "senza_messaggi": 0, "budget_claude": 0, "gia_ok": 0, "cache": 0}}
     now_iso = datetime.now(ITALY_TZ).isoformat()
@@ -1764,6 +2056,14 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
             report["skip"]["cliente"] += 1
             report["anomalie"].append({"chat_id": c["chat_id"], "nome": nome, "link": _link_lead(c), "cartelle": cartelle, "nota": "in cartella clienti ma senza pallino nel nome"})
             continue
+        # ---- 2b. E1: lead in registrazione -> cartella Registrazione (se esiste), whitelist -> Attesa la gestisce Jack ----
+        elif lead_state.get("reg", {}).get(c["chat_id"], {}).get("stato") in ("link_inviato", "in_registrazione", "registrato", "deposito_dichiarato", "ripensamento"):
+            if "registraz" in folder_ids_norm:
+                target, exclusive, motivo = "Registraz", True, f"E1: {lead_state['reg'][c['chat_id']]['stato']}"
+                if "registraz" in cart_norm and len(cartelle) == 1:
+                    report["skip"]["gia_ok"] += 1; continue
+            else:
+                report["skip"]["gia_ok"] += 1; continue
         # ---- 3. lead (compresi i vecchi lead rimasti in Contattare senza pallino: vanno tolti da li') ----
         else:
             exclusive = "contattare" in cart_norm
@@ -1916,6 +2216,9 @@ async def start_http_server():
     app.router.add_get("/get-single-chat", handle_get_single_chat)
     app.router.add_get("/folder-status",  handle_get_folder_status)
     app.router.add_post("/move-to-folder", handle_move_to_folder)
+    app.router.add_get("/reload-templates", handle_reload_templates)
+    app.router.add_get("/registrazione-followup", handle_followup_registrazione)
+    app.router.add_post("/registrazione-followup", handle_followup_registrazione)
     app.router.add_get("/reconcile-folders",  handle_reconcile_folders)
     app.router.add_post("/reconcile-folders", handle_reconcile_folders)
     runner = web.AppRunner(app)
@@ -1944,6 +2247,8 @@ async def main():
     except Exception as e:
         print(f"[WARN] warm-up dialoghi fallito: {e}")
     print(f"💾 Dati persistenti in: {DATA_DIR}{'' if DATA_DIR != _CODE_DIR else ' (NESSUN VOLUME: si perdono al deploy)'}")
+    await carica_template_salvati()
+    print(f"🧩 E1: {'TUTTI' if E1_ALL else ('test ids ' + str(sorted(E1_TEST_IDS)) if E1_TEST_IDS else 'SPENTO')}")
     print(f"🔧 Test mode: {TEST_MODE}")
     print(f"🎤 Whisper: {'attivo' if OPENAI_API_KEY else 'non configurato'}")
     print(f"🌙 Modalità notte attiva: {is_night_time()}")
