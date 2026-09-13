@@ -644,10 +644,11 @@ async def process_messages(sender_id, sender_info, debounce):
                     # NON dipende dalle parole del modello: il bridge lo manda il main con il testo fisso di Jack,
                     # il testo del modello in questo turno viene scartato (cosi' non puo' dire "ti registro io").
                     _rt_l = reply_text.lower()
+                    # In E1 ogni ESCALATION di Agent 1/2 su una chat non ancora in registrazione e' l'innesco,
+                    # tranne: richiesta di chiamata/vocale, frasi di attesa "verifico", lead perso dopo i 2 tentativi.
                     _innesco = (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
                                 and reg_get(sender_id).get("stato") not in STATI_REG
-                                and re.search(r'link|registr|iscri|axi|conto', _rt_l)
-                                and not re.search(r'verific(o|are) con il manager|sono in ufficio|ti rispondo domattina|chiamata|videochiamata', _rt_l))
+                                and not re.search(r'chiamata|videochiamata|vocale|verific|manager|ufficio|domattina|nessun problema|se in futuro|buona giornata|scrivimi', _rt_l))
                     if _innesco:
                         scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
                         await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
