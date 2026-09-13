@@ -640,13 +640,17 @@ async def process_messages(sender_id, sender_info, debounce):
                         return
                     # E1 — INNESCO: Agent 1 chiude con "ti giro il link" + ESCALATION. Se E1 e' attivo per questa chat
                     # e non e' gia' in registrazione, invece della pausa: link + tutorial + "Dimmi pure quando parti!"
-                    if (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
-                            and reg_get(sender_id).get("stato") not in STATI_REG
-                            and re.search(r'\blink\b', reply_text, re.I)):
-                        bridge = reply_text[7:].strip()
-                        bridge = re.sub(r'\[\s*[A-Z0-9_]+\s*\]', '', bridge).strip()
+                    # Innesco = ESCALATION di Agent 1 quando la chat e' allo step del capitale/registrazione.
+                    # NON dipende dalle parole del modello: il bridge lo manda il main con il testo fisso di Jack,
+                    # il testo del modello in questo turno viene scartato (cosi' non puo' dire "ti registro io").
+                    _rt_l = reply_text.lower()
+                    _innesco = (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
+                                and reg_get(sender_id).get("stato") not in STATI_REG
+                                and re.search(r'link|registr|iscri|axi|conto', _rt_l)
+                                and not re.search(r'verific(o|are) con il manager|sono in ufficio|ti rispondo domattina|chiamata|videochiamata', _rt_l))
+                    if _innesco:
                         scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
-                        await send_split_messages(sender_id, bridge or "Ok, ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso?")
+                        await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
                         ok1 = await invia_template(sender_id, "link_registrazione")
                         ok2 = await invia_template(sender_id, "tutorial_registrazione")
                         if ok1:
