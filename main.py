@@ -668,6 +668,12 @@ async def process_messages(sender_id, sender_info, debounce):
                                 topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
                         return
 
+                    # UN SOLO FLAG: se il modello ne ha scritti due (es. ALERT_CHIUSURA + ESCALATION),
+                    # vince l'ALERT specifico: l'escalation generica viene ignorata.
+                    if reply_text.startswith("[PAUSE]") and re.search(r'\[\s*ALERT[_\s]*(CHIUSURA|DEPOSITO|VERIFICA[_\s]*REFERRAL|REGISTRATO|RIPENSAMENTO)\s*\]', reply_text, re.I):
+                        print(f"[FLAG] due flag nello stesso messaggio: tengo l'ALERT, ignoro ESCALATION")
+                        reply_text = reply_text[7:]
+
                     # Gestione PAUSE — escalation
                     if reply_text.startswith("[PAUSE]"):
                         clean_reply = reply_text[7:].strip()
