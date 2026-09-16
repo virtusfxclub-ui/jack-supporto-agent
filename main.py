@@ -1347,6 +1347,9 @@ async def handle_resume_lead(request: web.Request) -> web.Response:
         chat_id = int(data.get("chat_id"))
         era_in_pausa = chat_id in paused_leads
         paused_leads.discard(chat_id)
+        if reg_get(chat_id).get("stato") == "ripensamento":
+            lead_state["reg"].pop(str(chat_id), None); _salva_lead_state()
+            print(f"[STATO] {chat_id}: ripensamento azzerato al Riprendi, torna in trattativa")
         _salva_paused_leads()
         print(f"[RESUME] Lead {chat_id} riattivato (era in pausa: {era_in_pausa})")
 
@@ -1795,6 +1798,17 @@ async def handle_followup_registrazione(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+async def handle_reset_reg(request: web.Request) -> web.Response:
+    """GET /reset-reg?chat_id=123 — azzera lo stato E1 di una chat (test, o lead che riparte da zero) e la toglie dalla pausa."""
+    cid = request.rel_url.query.get("chat_id", "")
+    if not cid.isdigit():
+        return web.json_response({"ok": False, "error": "chat_id mancante"}, status=400)
+    prima = lead_state.get("reg", {}).pop(cid, None)
+    paused_leads.discard(int(cid)); _salva_paused_leads(); _salva_lead_state()
+    print(f"[STATO] reset E1 per {cid} (era {prima})")
+    return web.json_response({"ok": True, "chat_id": cid, "stato_precedente": prima})
+
+
 async def handle_reload_templates(request: web.Request) -> web.Response:
     """GET /reload-templates — rilegge i messaggi salvati (dopo che Jack li ha modificati)."""
     return web.json_response({"ok": True, "templates": await carica_template_salvati()})
@@ -2064,6 +2078,8 @@ async def reconcile_folders(dry_run: bool = True, max_claude: int = 40, giorni: 
 
         # ---- 1. clienti: decide il pallino ----
         pallino = next((p for p in PALLINO_CARTELLA if p in nome), None)
+        if (pallino or "vip" in nome_l) and c["chat_id"] in lead_state.get("reg", {}) and not dry_run:
+            lead_state["reg"].pop(c["chat_id"], None); _salva_lead_state()   # e' un cliente: lo stato E1 e' chiuso
         if pallino:
             target, exclusive, motivo = PALLINO_CARTELLA[pallino], True, f"pallino {pallino}"
             if _norm_folder(target) in cart_norm and len(cartelle) == 1:
@@ -2244,6 +2260,7 @@ async def start_http_server():
     app.router.add_get("/folder-status",  handle_get_folder_status)
     app.router.add_post("/move-to-folder", handle_move_to_folder)
     app.router.add_get("/reload-templates", handle_reload_templates)
+    app.router.add_get("/reset-reg", handle_reset_reg)
     app.router.add_get("/registrazione-followup", handle_followup_registrazione)
     app.router.add_post("/registrazione-followup", handle_followup_registrazione)
     app.router.add_get("/reconcile-folders",  handle_reconcile_folders)
