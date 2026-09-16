@@ -1702,21 +1702,30 @@ async def invia_template(chat_id: int, key: str) -> bool:
 
 
 PROMPT_FU_REG = """Sei Jack di Virtus FX Club. Stai accompagnando un lead nella registrazione su AXI: ha gia' detto si', ha ricevuto il link e il tutorial, e non scrive da {ore} ore.
-STATO: {stato} (link_inviato = ha il link ma non ha ancora scritto; in_registrazione = sta facendo la procedura; registrato = conto aperto, manca il deposito)
-TOCCO NUMERO: {n} (1 = offerta di aiuto leggera, tipo "se ti blocchi da qualche parte mandami uno screen, ci sono io"; 2 = "sei riuscito?"; 3 = "novita'? ti tengo il posto"; 4 = ultimo, "dimmi se sei riuscito cosi' ti colleghiamo e non perdi l'operativita'")
+STATO: {stato} (link_inviato = ha il link ma non ha ancora iniziato; in_registrazione = sta facendo la procedura; registrato = conto aperto, manca il deposito)
+TOCCO NUMERO: {n} di 5
 ORARIO CHE IL LEAD AVEVA DICHIARATO: {orario} (se ha detto un momento preciso e quel momento non e' ancora passato rispetto a ORA, rispondi SKIP)
 ORA ATTUALE (Italia): {ora}
 
-Scrivi UN messaggio, massimo 2 righe, nello stile di Jack: corto, caldo, un punto esclamativo va bene, al massimo un'emoji (💪🤝). Riprendi dal punto esatto in cui il lead si era fermato (se aveva un problema con la carta, chiedi di quello; se stava attivando il bonus, di quello).
-REGOLE: usa il nome SOLO se il lead l'ha dichiarato lui. Niente pressione, niente urgenza, niente capitale, niente numeri, niente link. VIETATO "fammi sapere", "dimmi pure", "senza fretta". Non ripetere una frase gia' scritta nella chat. Se il lead ha detto chiaramente di non voler procedere: SKIP.
+COME SCRIVE JACK IN QUESTA FASE (esempi reali, usali come modello, non copiarli a caso):
+tocco 1, poco dopo: "Sei riuscito a registrarti?" oppure "Se ti blocchi da qualche parte mandami uno screen, ci sono io!"
+tocco 2, stessa giornata: "Sei riuscito [nome]?" / "Dimmi pure quando parti che ti seguo"
+tocco 3, giorno dopo, con aggancio al calendario: "Giorno [nome]! Oggi hai tempo di farla cosi' partiamo con l'inizio della settimana?" / "Ciao [nome], ti aspetto! Dimmi pure quando torni che ti seguo"
+tocco 4, FOMO vera e sobria: "Oggi il team ha gia' operato, ti aspettavo dentro" / "Con il copy abbiamo gia' operato oggi, cosi' non perdi l'operativita'"
+tocco 5, ultimo: "Dimmi se ti devo tenere il posto in community [nome], non mi hai piu' fatto sapere" (i posti nel VIP sono limitati e si aprono a scaglioni: e' vero e si puo' dire)
+
+REGOLE: massimo 2 righe. Nome solo se dichiarato dal lead, e non in tutti i messaggi. Un'emoji ogni tanto (💪 🤝 😊), non sempre. Niente punto finale. Riprendi dal punto esatto in cui si era fermato (se aveva un problema con la carta chiedi di quello, se stava attivando il bonus chiedi di quello).
+VIETATO: numeri di guadagno, "siamo a profitto", percentuali, promesse, link, capitale, scadenze inventate, "fammi sapere" da solo, "senza fretta". Non ripetere una frase gia' scritta nella chat. Se il lead ha detto chiaramente di non voler procedere, o e' in mezzo a un impegno serio che ha dichiarato (lavoro, emergenza, ferie): SKIP.
 
 ULTIMI MESSAGGI:
 {chat}
 
 Rispondi SOLO con il testo (o SKIP)."""
 
-SOGLIE_FU_REG = {  # ore dall'ultimo NOSTRO messaggio, per tocco 1..4
-    "link_inviato": [2, 12, 24, 48], "in_registrazione": [2, 12, 24, 48], "registrato": [6, 12, 48, 96],
+# Ore dall'ultimo NOSTRO messaggio, per tocco 1..5. In registrazione il ritmo e' piu' fitto che in vendita:
+# chi ha il link in mano e' caldo, e un promemoria lo sblocca. Dopo il quinto si passa a Jack, mai Perso.
+SOGLIE_FU_REG = {
+    "link_inviato": [2, 6, 20, 30, 48], "in_registrazione": [2, 6, 20, 30, 48], "registrato": [3, 8, 20, 30, 48],
 }
 
 
@@ -1732,7 +1741,7 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         if stato not in SOGLIE_FU_REG or int(cid) in paused_leads or not e1_attivo(cid):
             continue
         tocchi = int(r.get("tocchi", 0))
-        if tocchi >= 4:
+        if tocchi >= 5:
             continue
         if tocchi > 0 and not finestra_piena:
             report["skip"][cid] = "fuori finestra"; continue
@@ -1767,9 +1776,9 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         await send_split_messages(int(cid), testo)
         reg_set(cid, tocchi=tocchi + 1)
         report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "testo": testo})
-        if tocchi + 1 >= 4:
+        if tocchi + 1 >= 5:
             try:
-                await notify_jack(f"⏳ REGISTRAZIONE FERMA (E1)\n\nChat {cid}: stato {stato}, 4 tocchi senza risposta. Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
+                await notify_jack(f"⏳ REGISTRAZIONE FERMA (E1)\n\nChat {cid}: stato {stato}, 5 tocchi senza risposta. Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
                 report["alert"].append(cid)
             except Exception:
                 pass
