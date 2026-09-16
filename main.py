@@ -586,6 +586,22 @@ async def process_messages(sender_id, sender_info, debounce):
         print(f"[DEBOUNCE] {sender_info.get('full_name')} stava scrivendo: atteso {extra}s in piu'")
     if e1_attivo(sender_id) and reg_get(sender_id).get("stato") == "link_inviato":
         reg_set(sender_id, stato="in_registrazione")
+
+    # SCORCIATOIA DI TEST (solo id in E1_TEST_IDS, mai per i lead veri): "partiamo con 300, mandami il link"
+    # salta la vendita e innesca subito link + tutorial. Sparisce da sola quando E1_ALL=true.
+    if (not E1_ALL and int(sender_id) in E1_TEST_IDS and reg_get(sender_id).get("stato") not in STATI_REG):
+        _t = " ".join(m["text"] for m in pending_messages.get(sender_id, []) if m.get("media_type") in ("text", "screenshot")).lower()
+        if re.search(r'partiamo con\s*\d+', _t) and 'link' in _t:
+            print(f"[TEST] scorciatoia innesco E1 per {sender_id}")
+            pending_messages.pop(sender_id, None)
+            await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
+            ok1 = await invia_template(sender_id, "link_registrazione")
+            await invia_template(sender_id, "tutorial_registrazione")
+            if ok1:
+                await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
+                reg_set(sender_id, stato="link_inviato", scelta="copy", orario_dichiarato="", tocchi=0)
+                asyncio.create_task(notify_jack(f"🔗 LINK INVIATO (E1, scorciatoia test)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}", topic="alert"))
+            return
     if sender_id in paused_leads:
         print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
         pending_messages.pop(sender_id, None)
