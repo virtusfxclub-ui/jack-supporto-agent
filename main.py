@@ -119,7 +119,7 @@ paused_leads = _carica_paused_leads()
 # ═══════════════════════════════════════════════════════════════════════
 E1_ALL = os.environ.get("E1_ALL", "false").lower() == "true"
 E1_TEST_IDS = {int(x) for x in os.environ.get("E1_TEST_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
-STATI_REG = ("link_inviato", "in_registrazione", "registrato", "deposito_dichiarato", "whitelist", "ripensamento")
+STATI_REG = ("attesa_link", "link_inviato", "in_registrazione", "registrato", "deposito_dichiarato", "whitelist", "ripensamento")
 TEMPLATE_KEYS = ("link_registrazione", "tutorial_registrazione", "tutorial_mt5", "chiusura", "benvenuto")
 templates_salvati = {}   # key -> telethon Message dai "Messaggi salvati"
 
@@ -487,27 +487,80 @@ def normalizza_flag(text: str) -> str:
     return re.sub(r'\[\s*([A-Za-z0-9_\s]{1,40}?)\s*\]', _fix, text)
 
 
+_RE_FLAG_GLOBAL = re.compile(r'\[\s*(?:ESCALATION|NOTIFICA[_\s]*JACK|AGENT[_\s]*2|AUDIO[_\s]*\d|ALERT_[A-Z_]+|DOC:[a-z_]+|ORARIO:[^\]]*|PAUSE|SCREENSHOT:[^\]]*)\s*\]', re.I)
+
+
+def estrai_msg(text: str):
+    """Il modello scrive la risposta per il lead dentro <msg>...</msg>. Qui si tiene SOLO l'interno
+    dei tag (+ eventuali flag finiti fuori). Tutto il resto (ragionamenti) muore qui.
+    Ritorna (testo, con_tag). Stessa logica del nodo n8n 'Raccogli Output Agent'."""
+    text = re.sub(r'<\s*(/?)\s*m\s*s\s*g\s*>', lambda m: '</msg>' if m.group(1) else '<msg>', text or '', flags=re.I)
+    blocchi = [b.strip() for b in re.findall(r'<msg>([\s\S]*?)</msg>', text, flags=re.I) if b.strip()]
+    if blocchi:
+        testo, con_tag = "\n\n".join(blocchi), True
+    else:
+        i = text.lower().find('<msg>')
+        if i >= 0:
+            testo, con_tag = text[i + 5:], True
+        else:
+            testo, con_tag = text, False
+    if con_tag:
+        fuori = re.sub(r'<msg>[\s\S]*?</msg>', '', text, flags=re.I)
+        compatto = re.sub(r'\s+', '', testo)
+        for m in _RE_FLAG_GLOBAL.findall(fuori):
+            c = re.sub(r'\s+', '', m)
+            if c not in compatto:
+                testo += "\n" + c
+                compatto += c
+    testo = re.sub(r'</?msg>', '', testo, flags=re.I).strip()
+    return testo, con_tag
+
+
 _RE_META = [
     re.compile(r'\bstep\s*\d', re.I),
     re.compile(r"^\s*(deve|devo|dovrei|dovrebbe|bisogna|quindi si procede|analisi|ragionamento|nota|note interne|ok,? (il|la) lead)\b", re.I),
-    re.compile(r"\b(il lead|la lead|del lead|al lead|l'agent|l’agent|il prompt|la regola|le regole|il flag|il flusso)\b", re.I),
+    re.compile(r"\b(il lead|la lead|del lead|al lead|l'agent|l’agent|il prompt|la regola|le regole|il flag|il flusso|lo stato del lead)\b", re.I),
     re.compile(r'\[NOME\]', re.I),
     re.compile(r'\b(ESCALATION|NOTIFICA_?JACK|AGENT_?2|AUDIO_?\d)\b(?![^\[]*\])', re.I),
 ]
+_RE_META_DEBOLI = [
+    re.compile(r'\bfase di (chiusura|vendita|registrazione|apertura|qualifica)\b', re.I),
+    re.compile(r'\bin sospeso\b', re.I),
+    re.compile(r'\bnon (posso|devo|dovrei) (lasciar|rispondere|ignorar|forzar)', re.I),
+    re.compile(r'\bnon serve (rispondere|una risposta|insistere)\b', re.I),
+    re.compile(r'\bcontenuto informativo\b', re.I),
+    re.compile(r'\bun ok (di comprensione|generico|di cortesia)\b', re.I),
+    re.compile(r'\blink da (mandare|inviare)\b', re.I),
+    re.compile(r'\bcadere nel vuoto\b', re.I),
+    re.compile(r'\bè più un\b', re.I),
+    re.compile(r'\bnon è un ["\'“”‘’]', re.I),
+    re.compile(r'\b(questo|il suo|il tuo|quel) (messaggio|turno|ok|sì|si)\b', re.I),
+    re.compile(r'\brispond(o|ere|erò) con\b', re.I),
+    re.compile(r'\bconferma (di|che) (ha|aver|avere)\b', re.I),
+    re.compile(r'\b(chiusura|obiezione|escalation|notifica)\b', re.I),
+    re.compile(r'\b(procedo|proseguo|vado) (con|a|quindi)\b', re.I),
+    re.compile(r'\b(tono|approccio|strategia) (giusto|corretto|migliore|da usare)\b', re.I),
+    re.compile(r'\bmeglio (non|evitare|tenere|mantenere)\b', re.I),
+    re.compile(r'^\s*(quindi|ora|adesso|allora)[, ]+(rispondo|scrivo|mando|procedo|chiudo)', re.I),
+]
+
+
+def _is_meta(p: str) -> bool:
+    return any(r.search(p) for r in _RE_META) or sum(1 for r in _RE_META_DEBOLI if r.search(p)) >= 2
 
 
 def scarta_meta(text: str) -> str:
-    """Toglie i paragrafi 'meta': ragionamenti interni del modello finiti nell'output
-    ("Deve rispondere allo step 6: ..."). Seconda rete dopo n8n. Mai svuotare tutto."""
-    if not text or '\n' not in text:
-        # un solo paragrafo: se e' tutto meta, lo lascio (meglio di un silenzio) ma lo segnalo
-        if text and any(r.search(text) for r in _RE_META):
-            print(f"[META] paragrafo unico sospetto: {text[:80]}")
+    """Toglie i paragrafi 'meta': ragionamenti interni del modello finiti nell'output.
+    Segnali forti (1 basta) + segnali deboli (ne servono 2). Rete di riserva dopo estrai_msg.
+    Se TUTTO e' meta: restano solo i flag (l'alert deve partire), il testo NO. Meglio il silenzio del leak."""
+    if not text:
         return text
     paragrafi = re.split(r'\n\s*\n', text)
-    tenuti = [p for p in paragrafi if not any(r.search(p) for r in _RE_META)]
+    tenuti = [p for p in paragrafi if not _is_meta(p)]
     if not tenuti:
-        return text
+        flags = _RE_FLAG_GLOBAL.findall(text)
+        print(f"[META] tutto il testo era interno, scartato: {text[:120]}")
+        return " ".join(flags) if flags else ""
     if len(tenuti) != len(paragrafi):
         print(f"[META] scartati {len(paragrafi) - len(tenuti)} paragrafi interni")
     return "\n\n".join(tenuti)
@@ -595,12 +648,8 @@ async def process_messages(sender_id, sender_info, debounce):
             print(f"[TEST] scorciatoia innesco E1 per {sender_id}")
             pending_messages.pop(sender_id, None)
             await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
-            ok1 = await invia_template(sender_id, "link_registrazione")
-            await invia_template(sender_id, "tutorial_registrazione")
-            if ok1:
-                await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
-                reg_set(sender_id, stato="link_inviato", scelta="copy", orario_dichiarato="", tocchi=0)
-                asyncio.create_task(notify_jack(f"🔗 LINK INVIATO (E1, scorciatoia test)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}", topic="alert"))
+            reg_set(sender_id, stato="attesa_link", scelta="copy", orario_dichiarato="", tocchi=0)
+            asyncio.create_task(notify_jack(f"🔗 INNESCO E1 (scorciatoia test)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}", topic="alert"))
             return
     if sender_id in paused_leads:
         print(f"[PAUSED] {sender_info['full_name']} è in pausa — ignoro")
@@ -638,15 +687,30 @@ async def process_messages(sender_id, sender_info, debounce):
                 timeout=aiohttp.ClientTimeout(total=180)
             ) as resp:
                 if resp.status == 200:
+                    _grezzo = ""
                     try:
                         reply_text = await resp.text()
                         # Ricuci SUBITO: se la risposta arriva in streaming i flag possono
                         # essere spezzati ("[NOTIFICA_JAC\nK]") e i controlli sotto fallirebbero.
+                        _grezzo = reply_text
+                        reply_text, _con_tag = estrai_msg(reply_text)
+                        if not _con_tag and reply_text and not reply_text.startswith("[BLOCK]"):
+                            print("[META] risposta senza tag <msg>: uso il filtro di riserva")
                         reply_text = scarta_meta(ricuci_testo(normalizza_flag(reply_text))).strip()
                     except Exception:
                         reply_text = ""
                     if not reply_text:
                         print(f"[WARN] Nessuna reply ricevuta da n8n")
+                        if (_grezzo or "").strip():
+                            # Il filtro anti-leak ha scartato TUTTO: il lead non riceve nulla, Jack deve saperlo subito
+                            try:
+                                await notify_jack(
+                                    f"🧹 RISPOSTA SCARTATA (anti-leak)\n\n👤 {sender_info['full_name']}\n"
+                                    f"Il modello ha scritto solo ragionamento, al lead non e' partito nulla. Rispondi tu.\n\n"
+                                    f"Testo scartato:\n{_grezzo[:500]}\n\n👉 {link_chat(sender_info, sender_id)}",
+                                    topic="alert")
+                            except Exception as _e:
+                                print(f"[NOTIFY ERROR] scarto {sender_id}: {_e}")
                         return
                     # Gestione BLOCK — proposta commerciale
                     if reply_text.startswith("[BLOCK]"):
@@ -667,21 +731,12 @@ async def process_messages(sender_id, sender_info, debounce):
                                 and not re.search(r'chiamata|videochiamata|vocale|verific|manager|ufficio|domattina|nessun problema|se in futuro|buona giornata|scrivimi', _rt_l))
                     if _innesco:
                         scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
+                        # Solo la domanda. Il link parte quando risponde (Agent 3) o dopo 2h di silenzio (follow-up).
                         await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
-                        ok1 = await invia_template(sender_id, "link_registrazione")
-                        ok2 = await invia_template(sender_id, "tutorial_registrazione")
-                        if ok1:
-                            await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
-                            reg_set(sender_id, stato="link_inviato", scelta=scelta, orario_dichiarato="", tocchi=0)
-                            asyncio.create_task(notify_jack(
-                                f"🔗 LINK INVIATO (E1)\n\n👤 {sender_info['full_name']}\n\nL'agent lo segue nella registrazione. Tu entri a deposito fatto.\n👉 {link_chat(sender_info, sender_id)}",
-                                topic="alert"))
-                        else:
-                            # template mancante: comportamento classico, pausa + escalation
-                            paused_leads.add(sender_id); _salva_paused_leads()
-                            asyncio.create_task(notify_jack(
-                                f"⚫ ESCALATION (E1: template link non trovato nei messaggi salvati)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}",
-                                topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
+                        reg_set(sender_id, stato="attesa_link", scelta=scelta, orario_dichiarato="", tocchi=0)
+                        asyncio.create_task(notify_jack(
+                            f"🔗 INNESCO E1\n\n👤 {sender_info['full_name']}\n\nCapitale concordato, chiesto se ha 10 minuti. Il link parte alla sua risposta (o dopo 2h). Tu entri a deposito fatto.\n👉 {link_chat(sender_info, sender_id)}",
+                            topic="alert"))
                         return
 
                     # UN SOLO FLAG: se il modello ne ha scritti due (es. ALERT_CHIUSURA + ESCALATION),
@@ -860,8 +915,11 @@ async def process_messages(sender_id, sender_info, debounce):
                     for k in doc_da_inviare:
                         await asyncio.sleep(random.uniform(1.5, 3.0))
                         ok = await invia_template(sender_id, k)
-                        if ok and k == "link_registrazione" and reg_get(sender_id).get("stato") not in STATI_REG:
+                        if ok and k == "link_registrazione" and reg_get(sender_id).get("stato") in ("", None, "attesa_link"):
                             reg_set(sender_id, stato="link_inviato", tocchi=0)
+                    if "link_registrazione" in doc_da_inviare and "tutorial_registrazione" in doc_da_inviare:
+                        await asyncio.sleep(random.uniform(1.5, 3.0))
+                        await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
                     # E1: orario dichiarato dal lead (l'agent lo scrive come [ORARIO: ...])
                     m_or = re.search(r'\[\s*ORARIO\s*:\s*([^\]]{2,40})\]', reply_text, re.I)
                     if m_or and e1_attivo(sender_id):
@@ -1313,7 +1371,7 @@ async def genera_followup(chat_id: int, n: int, caldo: bool, ore: float) -> str:
         return ""
     if not out or out.upper().startswith("SKIP"):
         return ""
-    out = ricuci_testo(normalizza_flag(out))
+    out = scarta_meta(ricuci_testo(normalizza_flag(estrai_msg(out)[0])))
     out = re.sub(r'\[\s*[A-Z0-9_]+\s*\]', '', out).strip()   # nessun flag nei follow-up
     return out[:500]
 
@@ -1744,7 +1802,7 @@ Rispondi SOLO con il testo (o SKIP)."""
 # Ore dall'ultimo NOSTRO messaggio, per tocco 1..5. In registrazione il ritmo e' piu' fitto che in vendita:
 # chi ha il link in mano e' caldo, e un promemoria lo sblocca. Dopo il quinto si passa a Jack, mai Perso.
 SOGLIE_FU_REG = {
-    "link_inviato": [2, 6, 20, 30, 48], "in_registrazione": [2, 6, 20, 30, 48], "registrato": [3, 8, 20, 30, 48],
+    "attesa_link": [2], "link_inviato": [2, 6, 20, 30, 48], "in_registrazione": [2, 6, 20, 30, 48], "registrato": [3, 8, 20, 30, 48],
 }
 
 
@@ -1775,6 +1833,16 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
             continue
         if dry_run:
             report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "dry_run": True}); continue
+        if stato == "attesa_link":
+            # non ha risposto a "hai 10 minuti?": il link parte lo stesso, senza pressione
+            if r.get("orario_dichiarato"):
+                continue   # ha detto quando: si aspetta l'agent al suo ritorno
+            await send_split_messages(int(cid), "Intanto ti lascio qui il link, così quando hai 10 minuti lo fai e mi scrivi")
+            ok1 = await invia_template(int(cid), "link_registrazione")
+            await invia_template(int(cid), "tutorial_registrazione")
+            if ok1:
+                reg_set(cid, stato="link_inviato", tocchi=1)
+            report["inviati"].append({"chat_id": cid, "stato": "attesa_link->link_inviato", "tocco": 1}); continue
         chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-14:])
         prompt = PROMPT_FU_REG.format(ore=int(ore), stato=stato, n=tocchi + 1, orario=r.get("orario_dichiarato") or "nessuno",
                                       ora=now_it.strftime("%A %H:%M"), chat=chat_text)
@@ -1790,7 +1858,7 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
             report["skip"][cid] = f"generazione fallita {e}"; continue
         if not testo or testo.upper().startswith("SKIP"):
             report["skip"][cid] = "SKIP dal modello"; continue
-        testo = scarta_meta(ricuci_testo(normalizza_flag(testo)))
+        testo = scarta_meta(ricuci_testo(normalizza_flag(estrai_msg(testo)[0])))
         testo = re.sub(r'\[\s*[A-Z0-9_:]+\s*\]', '', testo).strip()[:400]
         await send_split_messages(int(cid), testo)
         reg_set(cid, tocchi=tocchi + 1)
