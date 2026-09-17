@@ -2591,6 +2591,50 @@ async def start_http_server():
     await site.start()
     print(f"[HTTP] Server avviato su 0.0.0.0:{PORT}")
     return runner
+# --- Guardiano del webhook del bot (bottoni "Riprendi agent") ---
+# Telegram tiene UN solo webhook per bot. Se un altro workflow n8n con un Telegram Trigger sullo stesso bot si (ri)attiva,
+# o n8n si riavvia, il webhook verso /telegram-callback sparisce e i bottoni muoiono in silenzio. Qui ogni 10 minuti:
+# vuoto -> lo rimettiamo; punta altrove -> avvisiamo Jack (non lo sovrascriviamo: potrebbe servire a un altro flusso).
+TELEGRAM_CALLBACK_URL = os.environ.get("TELEGRAM_CALLBACK_URL", "https://giacomojack.app.n8n.cloud/webhook/telegram-callback")
+_webhook_avviso_inviato = ""
+
+
+async def webhook_guardian():
+    global _webhook_avviso_inviato
+    await asyncio.sleep(20)
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{base}/getWebhookInfo", timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    info = (await r.json()).get("result", {}) or {}
+                url = info.get("url") or ""
+                if not url:
+                    async with s.post(f"{base}/setWebhook", json={"url": TELEGRAM_CALLBACK_URL, "allowed_updates": ["callback_query"]}, timeout=aiohttp.ClientTimeout(total=20)) as r2:
+                        ok = (await r2.json()).get("ok")
+                    print(f"[WEBHOOK] era vuoto, rimesso su {TELEGRAM_CALLBACK_URL}: ok={ok}")
+                    if _webhook_avviso_inviato != "rimesso":
+                        _webhook_avviso_inviato = "rimesso"
+                        await notify_jack("🔧 WEBHOOK BOT\n\nIl webhook del bot dei bottoni era sparito: l'ho rimesso io. I bottoni 'Riprendi agent' tornano a funzionare.", topic="alert")
+                elif url.rstrip("/") != TELEGRAM_CALLBACK_URL.rstrip("/"):
+                    if _webhook_avviso_inviato != url:
+                        _webhook_avviso_inviato = url
+                        await notify_jack(
+                            f"⚠️ WEBHOOK BOT OCCUPATO\n\nIl bot dei bottoni punta a:\n{url}\n\nNon e' l'indirizzo di n8n per i bottoni, quindi 'Riprendi agent' NON funziona. "
+                            f"Probabile: un altro workflow n8n usa lo stesso bot con un Telegram Trigger. Non lo tocco io: decidi tu quale dei due deve avere il bot "
+                            f"(o usa un secondo bot per i bottoni). Intanto nel gruppo di controllo funziona sempre: riprendi <id>", topic="alert")
+                else:
+                    err = info.get("last_error_message")
+                    if err and info.get("last_error_date", 0) > time.time() - 900 and _webhook_avviso_inviato != f"err:{err}":
+                        _webhook_avviso_inviato = f"err:{err}"
+                        await notify_jack(f"⚠️ WEBHOOK BOT: Telegram non riesce a consegnare i bottoni a n8n ({err}). Controlla che il workflow sia pubblicato.", topic="alert")
+                    elif not err:
+                        _webhook_avviso_inviato = ""
+        except Exception as e:
+            print(f"[WEBHOOK] controllo fallito: {e}")
+        await asyncio.sleep(600)
+
+
 async def main():
     print("🚀 Jack Supporto Agent avviato")
     await client.connect()
@@ -2632,6 +2676,7 @@ async def main():
     except Exception as e:
         print(f"[WARN] {e}")
     http_runner = await start_http_server()
+    asyncio.create_task(webhook_guardian())
     try:
         await client.run_until_disconnected()
     finally:
