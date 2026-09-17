@@ -661,6 +661,9 @@ async def process_messages(sender_id, sender_info, debounce):
     messages = pending_messages.pop(sender_id, [])
     pending_tasks.pop(sender_id, None)
     combined_text = "\n".join([m["text"] for m in messages if m.get("text")])
+    # E1: il lead ha scritto -> il conto dei solleciti riparte da zero (Jack riprende il ritmo da capo, non dal 4o tocco)
+    if e1_attivo(sender_id) and reg_get(sender_id).get("stato") in STATI_REG and int(reg_get(sender_id).get("tocchi", 0) or 0) > 0:
+        reg_set(sender_id, tocchi=0)
     media_type = messages[-1].get("media_type", "text")
     print(f"[MSG IN] {sender_info['full_name']}: {combined_text[:100]}")
     # Carica storico chat Telethon se disponibile
@@ -912,14 +915,30 @@ async def process_messages(sender_id, sender_info, debounce):
                         print(f"[MSG OUT] → {sender_info['full_name']}: {clean_reply[:80]}")
 
                     # E1: documenti dai messaggi salvati, dopo il testo
+                    doc_ok = []
                     for k in doc_da_inviare:
                         await asyncio.sleep(random.uniform(1.5, 3.0))
-                        ok = await invia_template(sender_id, k)
+                        ok = await invia_template(sender_id, k, sender_info['full_name'])
+                        if ok:
+                            doc_ok.append(k)
                         if ok and k == "link_registrazione" and reg_get(sender_id).get("stato") in ("", None, "attesa_link"):
-                            reg_set(sender_id, stato="link_inviato", tocchi=0)
-                    if "link_registrazione" in doc_da_inviare and "tutorial_registrazione" in doc_da_inviare:
+                            reg_set(sender_id, stato="link_inviato", tocchi=0, rapido_ts="")
+                    if "link_registrazione" in doc_ok and "tutorial_registrazione" in doc_ok:
                         await asyncio.sleep(random.uniform(1.5, 3.0))
                         await send_split_messages(sender_id, "Dimmi pure quando parti! 💪")
+                    if "link_registrazione" in doc_ok:
+                        _mancanti = [k for k in doc_da_inviare if k not in doc_ok]
+                        asyncio.create_task(notify_jack(
+                            f"🔗 LINK INVIATO (E1)\n\n👤 {sender_info['full_name']}\n\nHa ricevuto il link di registrazione"
+                            + (" e il tutorial" if "tutorial_registrazione" in doc_ok else "")
+                            + (f". NON partito: {', '.join(_mancanti)} (mandalo tu)" if _mancanti else "")
+                            + f". L'agent lo segue fino al deposito; se resta fermo lo risente dopo 10-15 minuti, poi 2h.\n👉 {_link}",
+                            topic="alert"))
+                    elif "link_registrazione" in doc_da_inviare:
+                        # il modello ha promesso il link ma il template non e' partito: il lead aspetta a vuoto
+                        asyncio.create_task(notify_jack(
+                            f"🚨 LINK NON PARTITO (E1)\n\n👤 {sender_info['full_name']}\n\nL'agent gli ha detto 'ti giro il link' ma il "
+                            f"messaggio salvato non e' partito. Mandaglielo tu ADESSO dai Messaggi salvati.\n👉 {_link}", topic="alert"))
                     # E1: orario dichiarato dal lead (l'agent lo scrive come [ORARIO: ...])
                     m_or = re.search(r'\[\s*ORARIO\s*:\s*([^\]]{2,40})\]', reply_text, re.I)
                     if m_or and e1_attivo(sender_id):
@@ -961,6 +980,9 @@ async def process_messages(sender_id, sender_info, debounce):
                                     os.remove(tmp_path)
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
+
+                    # E1: se dopo la nostra risposta resta fermo 10-15 minuti, lo risentiamo (come fa Jack)
+                    programma_fu_rapido(sender_id, sender_info)
 
                 else:
                     print(f"[ERROR] n8n status: {resp.status}")
@@ -1145,6 +1167,7 @@ async def handle_incoming(event):
                     debounce = DEBOUNCE_TEXT
         if not message_text.strip():
             return
+        annulla_fu_rapido(sender_id)   # ha scritto: il sollecito dei 10-15 minuti non serve piu'
         if sender_id not in pending_messages:
             pending_messages[sender_id] = []
         pending_messages[sender_id].append({
@@ -1331,6 +1354,11 @@ NUMERO DEL FOLLOW-UP: {n} di 3
 - 1: leggero, un promemoria naturale sul punto lasciato aperto
 - 2: riprendi il punto e proponi il passo concreto (se aveva detto un capitale: "ce li hai i [cifra]? ti giro il link")
 - 3: domanda secca e diretta: c'e' qualcosa che non ti ha convinto?
+COME SCRIVE JACK I FOLLOW-UP (esempi reali, usali come modello e adattali al punto in cui si era fermata la chat):
+- 1: "Fammi sapere se hai domande, sarei felice di averti in community 😊" / "Ci sei? Se hai dubbi te li chiarisco volentieri"
+- 2: "Nel gruppo continuiamo a condividere le operazioni ogni giorno, ci stai dando un'occhiata?" / "Allora, confermiamo i [cifra] e ti giro il link?"
+- 3: "Ti faccio una domanda secca: c'e' qualcosa che non ti ha convinto? Dimmelo pure com'e', se posso chiarirtelo lo faccio volentieri" / "Non mi hai fatto piu' sapere nulla, aspettavo la tua risposta"
+Il nome davanti ai messaggi nello storico e' l'etichetta del profilo Telegram e NON vale come nome dichiarato.
 LEAD CALDO: {caldo}. Se caldo (aveva detto il capitale o che si registrava), vai dritto: chiedi se procede e proponi di mandargli il link.
 
 REGOLE FERREE:
@@ -1750,64 +1778,183 @@ async def carica_template_salvati() -> dict:
     return {k: (v.message or "")[:60] for k, v in trovati.items()}
 
 
-async def invia_template(chat_id: int, key: str) -> bool:
-    """Invia al lead una COPIA (non un inoltro) del messaggio salvato: testo, link cliccabili, PDF."""
+def _entita_valide(testo: str, entities):
+    """Tiene solo le entita' (grassetto, link...) che stanno dentro il testo: dopo aver tolto la riga '#etichetta'
+    un'entita' fuori bordo farebbe fallire l'invio. Gli offset Telegram sono in unita' UTF-16."""
+    if not entities:
+        return None
+    n16 = len(testo.encode('utf-16-le')) // 2
+    ok = [e for e in entities if getattr(e, 'offset', 0) + getattr(e, 'length', 0) <= n16]
+    return ok or None
+
+
+async def invia_template(chat_id: int, key: str, nome_lead: str = "") -> bool:
+    """Invia al lead una COPIA (non un inoltro) del messaggio salvato: testo, link cliccabili, PDF/video.
+    Il messaggio viene RILETTO dai Messaggi salvati a ogni invio: l'allegato tenuto in cache da ore ha il
+    riferimento file scaduto e Telegram rifiuta l'invio (e' il motivo per cui il tutorial non partiva).
+    Se l'invio fallisce si riprova una volta; se fallisce ancora si manda testo e file separati;
+    se non parte comunque, Jack riceve un alert e lo manda a mano."""
     msg = templates_salvati.get(key)
     if msg is None:
         await carica_template_salvati(); msg = templates_salvati.get(key)
     if msg is None:
-        print(f"[TEMPLATE] '{key}' non trovato nei messaggi salvati"); return False
-    testo = (msg.message or "").rstrip()
-    righe = testo.splitlines()
-    if righe and righe[-1].strip().startswith("#"):
-        testo = "\n".join(righe[:-1]).rstrip()
-    # Solo documenti e foto si riallegano. L'anteprima di un link (MessageMediaWebPage) NON e' un file:
-    # si lascia che Telegram la ricrei dal link nel testo.
-    allegato = msg.media if isinstance(msg.media, (MessageMediaDocument, MessageMediaPhoto)) else None
-    try:
+        print(f"[TEMPLATE] '{key}' non trovato nei messaggi salvati")
+        asyncio.create_task(notify_jack(
+            f"📎 TEMPLATE MANCANTE\n\nNei Messaggi salvati non c'e' nessun messaggio che finisce con #{key}. "
+            f"Il lead {nome_lead or chat_id} lo aspetta: mandaglielo tu.\n👉 tg://user?id={chat_id}", topic="alert"))
+        return False
+
+    async def _fresco(m):
+        try:
+            f = await client.get_messages('me', ids=m.id)
+            return f if f is not None else m
+        except Exception as e:
+            print(f"[TEMPLATE] rilettura '{key}' fallita ({e}), uso la copia in cache"); return m
+
+    async def _prova(m, separa: bool) -> bool:
+        testo = (m.message or "").rstrip()
+        righe = testo.splitlines()
+        if righe and righe[-1].strip().startswith("#"):
+            testo = "\n".join(righe[:-1]).rstrip()
+        # Solo documenti e foto si riallegano. L'anteprima di un link (MessageMediaWebPage) NON e' un file.
+        allegato = m.media if isinstance(m.media, (MessageMediaDocument, MessageMediaPhoto)) else None
+        ent = _entita_valide(testo, m.entities)
         async with client.action(chat_id, 'document' if allegato else 'typing'):
             await asyncio.sleep(random.uniform(2, 4))
-        await client.send_message(chat_id, testo, formatting_entities=msg.entities, file=allegato, link_preview=True)
+        if allegato and separa:
+            # prima il file (se non parte, non parte nulla), poi il testo
+            await client.send_file(chat_id, allegato)
+            if testo:
+                await asyncio.sleep(random.uniform(1, 2))
+                await client.send_message(chat_id, testo, formatting_entities=ent, link_preview=True)
+        else:
+            await client.send_message(chat_id, testo, formatting_entities=ent, file=allegato, link_preview=True)
         agent_messages.setdefault(chat_id, []).append(testo.strip())
-        r = reg_get(chat_id); docs = list(r.get("docs", []))
-        if key not in docs: docs.append(key)
-        reg_set(chat_id, docs=docs)
-        print(f"[TEMPLATE] inviato '{key}' a {chat_id}")
         return True
-    except Exception as e:
-        print(f"[TEMPLATE] invio '{key}' a {chat_id} fallito: {e}"); return False
+
+    ultimo_errore = ""
+    for tentativo in (1, 2, 3):
+        try:
+            if tentativo == 2:
+                await carica_template_salvati(); msg = templates_salvati.get(key) or msg
+            m = await _fresco(msg)
+            await _prova(m, separa=(tentativo == 3))
+            r = reg_get(chat_id); docs = list(r.get("docs", []))
+            if key not in docs: docs.append(key)
+            reg_set(chat_id, docs=docs)
+            print(f"[TEMPLATE] inviato '{key}' a {chat_id} (tentativo {tentativo})")
+            return True
+        except Exception as e:
+            ultimo_errore = f"{type(e).__name__}: {e}"
+            print(f"[TEMPLATE] invio '{key}' a {chat_id} fallito (tentativo {tentativo}): {ultimo_errore}")
+            await asyncio.sleep(1.5)
+    asyncio.create_task(notify_jack(
+        f"📎 TEMPLATE NON INVIATO\n\n👤 {nome_lead or chat_id}\nIl messaggio salvato #{key} non e' partito dopo 3 tentativi "
+        f"({ultimo_errore[:120]}). Mandaglielo tu dai Messaggi salvati.\n👉 tg://user?id={chat_id}", topic="alert"))
+    return False
 
 
-PROMPT_FU_REG = """Sei Jack di Virtus FX Club. Stai accompagnando un lead nella registrazione su AXI: ha gia' detto si', ha ricevuto il link e il tutorial, e non scrive da {ore} ore.
+PROMPT_FU_REG = """Sei Jack di Virtus FX Club. Stai accompagnando un lead nella registrazione su AXI: ha gia' detto si', ha ricevuto il link e il tutorial, e non scrive da {tempo}.
 STATO: {stato} (link_inviato = ha il link ma non ha ancora iniziato; in_registrazione = sta facendo la procedura; registrato = conto aperto, manca il deposito)
-TOCCO NUMERO: {n} di 5
+SOLLECITO NUMERO: {n} di 5
 ORARIO CHE IL LEAD AVEVA DICHIARATO: {orario} (se ha detto un momento preciso e quel momento non e' ancora passato rispetto a ORA, rispondi SKIP)
 ORA ATTUALE (Italia): {ora}
 
-COME SCRIVE JACK IN QUESTA FASE (esempi reali, usali come modello, non copiarli a caso):
-tocco 1, poco dopo: "Sei riuscito a registrarti?" oppure "Se ti blocchi da qualche parte mandami uno screen, ci sono io!"
-tocco 2, stessa giornata: "Sei riuscito [nome]?" / "Dimmi pure quando parti che ti seguo"
-tocco 3, giorno dopo, con aggancio al calendario: "Giorno [nome]! Oggi hai tempo di farla cosi' partiamo con l'inizio della settimana?" / "Ciao [nome], ti aspetto! Dimmi pure quando torni che ti seguo"
-tocco 4, FOMO vera e sobria: "Oggi il team ha gia' operato, ti aspettavo dentro" / "Con il copy abbiamo gia' operato oggi, cosi' non perdi l'operativita'"
-tocco 5, ultimo: "Dimmi se ti devo tenere il posto in community [nome], non mi hai piu' fatto sapere" (i posti nel VIP sono limitati e si aprono a scaglioni: e' vero e si puo' dire)
+COME SCRIVE JACK IN QUESTA FASE (esempi reali: usali come modello, scegli quello che calza con il punto in cui si e' fermato, non copiarli a caso):
+sollecito 1, dopo 10-15 minuti di silenzio: "Sei riuscito a registrarti?" / "Tutto ok? Se ti blocchi da qualche parte mandami uno screen, ci sono io!" / (se sta depositando) "Sei riuscito con il deposito?"
+sollecito 2, dopo un paio d'ore: "Sei riuscito [nome]?" / "Dimmi pure quando parti che ti seguo" / "Ci sei? Se hai avuto un problema con la carta dimmelo che lo risolviamo"
+sollecito 3, stessa giornata o mattina dopo, con aggancio al calendario: "Giorno [nome]! Oggi hai tempo di farla cosi' partiamo?" (se e' lunedi': "...cosi' partiamo con l'inizio della settimana?") / "Ciao [nome], ti aspetto! Dimmi pure quando torni che ti seguo"
+sollecito 4, FOMO vera e sobria: "Oggi il team ha gia' operato, ti aspettavo dentro" / "Con il copy abbiamo gia' operato oggi, cosi' non perdi l'operativita'"
+sollecito 5, ultimo: "Dimmi se ti devo tenere il posto in community [nome], non mi hai piu' fatto sapere" (i posti nel VIP sono limitati e si aprono a scaglioni: e' vero e si puo' dire)
 
-REGOLE: massimo 2 righe. Nome solo se dichiarato dal lead, e non in tutti i messaggi. Un'emoji ogni tanto (💪 🤝 😊), non sempre. Niente punto finale. Riprendi dal punto esatto in cui si era fermato (se aveva un problema con la carta chiedi di quello, se stava attivando il bonus chiedi di quello).
-VIETATO: numeri di guadagno, "siamo a profitto", percentuali, promesse, link, capitale, scadenze inventate, "fammi sapere" da solo, "senza fretta". Non ripetere una frase gia' scritta nella chat. Se il lead ha detto chiaramente di non voler procedere, o e' in mezzo a un impegno serio che ha dichiarato (lavoro, emergenza, ferie): SKIP.
+REGOLE: massimo 2 righe, spesso una sola. Il nome davanti ai messaggi e' l'etichetta del profilo Telegram e NON vale: usa il nome SOLO se il lead lo ha scritto lui in un messaggio ("sono Marco"), e comunque non in tutti i solleciti. Un'emoji ogni tanto (💪 🤝 😊), non sempre. Niente punto finale. Riprendi dal punto esatto in cui si era fermato (se aveva un problema con la carta chiedi di quello, se stava attivando il bonus chiedi di quello, se aveva mandato uno screen di una pagina chiedi se e' andato avanti da li').
+VIETATO: numeri di guadagno, "siamo a profitto", percentuali, promesse, link, capitale, scadenze inventate, "fammi sapere" da solo, "senza fretta", "resto a disposizione". Non ripetere una frase gia' scritta nella chat (se "Sei riuscito?" c'e' gia', cambia). Se il lead ha detto chiaramente di non voler procedere, o e' in mezzo a un impegno serio che ha dichiarato (lavoro, emergenza, ferie, "lo faccio stasera/domani" e quel momento non e' ancora arrivato): SKIP.
 
 ULTIMI MESSAGGI:
 {chat}
 
-Rispondi SOLO con il testo (o SKIP)."""
+Rispondi SOLO con il testo del messaggio (o SKIP), senza virgolette."""
 
-# Ore dall'ultimo NOSTRO messaggio, per tocco 1..5. In registrazione il ritmo e' piu' fitto che in vendita:
-# chi ha il link in mano e' caldo, e un promemoria lo sblocca. Dopo il quinto si passa a Jack, mai Perso.
+# Ore dall'ultimo NOSTRO messaggio per i solleciti orari (tocco 1..4), dopo il sollecito rapido dei 10-15 minuti
+# che parte dal main (programma_fu_rapido). Ritmo di Jack: 10-15 min -> 2h -> 6h -> giorno dopo -> 48h -> a Jack, mai Perso.
+# attesa_link: dopo 2h senza risposta a "hai 10 minuti?" il link parte lo stesso.
 SOGLIE_FU_REG = {
-    "attesa_link": [2], "link_inviato": [2, 6, 20, 30, 48], "in_registrazione": [2, 6, 20, 30, 48], "registrato": [3, 8, 20, 30, 48],
+    "attesa_link": [2], "link_inviato": [2, 6, 24, 48], "in_registrazione": [2, 6, 24, 48], "registrato": [2, 8, 24, 48],
 }
+STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
+FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido
+FU_RAPIDO_PAUSA_ORE = 3                             # non piu' di un sollecito rapido ogni 3 ore per chat
+fu_rapido_tasks = {}
+
+
+async def _genera_testo_fu_reg(cid: int, stato: str, n: int, tempo: str, msgs: list) -> str:
+    r = reg_get(cid); now_it = datetime.now(ITALY_TZ)
+    chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-14:])
+    prompt = PROMPT_FU_REG.format(tempo=tempo, stato=stato, n=n, orario=r.get("orario_dichiarato") or "nessuno",
+                                  ora=now_it.strftime("%A %H:%M"), chat=chat_text)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
+            timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            d = await resp.json(); testo = (d.get("content", [{}])[0].get("text") or "").strip().strip('"')
+    if not testo or testo.upper().startswith("SKIP"):
+        return ""
+    testo = scarta_meta(ricuci_testo(normalizza_flag(estrai_msg(testo)[0])))
+    return re.sub(r'\[\s*[A-Z0-9_:]+\s*\]', '', testo).strip()[:400]
+
+
+def annulla_fu_rapido(chat_id):
+    t = fu_rapido_tasks.pop(chat_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+
+
+def programma_fu_rapido(chat_id, sender_info: dict):
+    """Dopo una nostra risposta in fase di registrazione: se il lead resta fermo 10-15 minuti, un sollecito leggero
+    ("Sei riuscito a registrarti?"). Come fa Jack. Si annulla da solo se il lead scrive prima."""
+    if not e1_attivo(chat_id) or reg_get(chat_id).get("stato") not in STATI_FU_RAPIDO:
+        return
+    annulla_fu_rapido(chat_id)
+    fu_rapido_tasks[chat_id] = asyncio.create_task(_fu_rapido(chat_id, sender_info))
+
+
+async def _fu_rapido(chat_id, sender_info: dict):
+    try:
+        attesa = random.randint(FU_RAPIDO_MIN, FU_RAPIDO_MAX)
+        await asyncio.sleep(attesa)
+        r = reg_get(chat_id); stato = r.get("stato")
+        if stato not in STATI_FU_RAPIDO or chat_id in paused_leads or is_night_time():
+            return
+        if pending_messages.get(chat_id):
+            return   # sta scrivendo adesso: risponde l'agent
+        if stato == "link_inviato" and r.get("orario_dichiarato"):
+            return   # ha detto quando lo fa: non si assilla
+        ore_rapido = _ore_da(r.get("rapido_ts") or "")
+        if ore_rapido is not None and ore_rapido < FU_RAPIDO_PAUSA_ORE:
+            return
+        _, msgs = await read_chat_messages(int(chat_id), hours=48, limit=30)
+        if not msgs or not _is_our_sender(msgs[-1]["sender"]):
+            return
+        silenzio = _ore_da(msgs[-1]["timestamp_iso"]) or 0
+        if silenzio * 60 < FU_RAPIDO_MIN / 60 - 1:
+            return
+        testo = await _genera_testo_fu_reg(int(chat_id), stato, 1, f"{int(silenzio * 60)} minuti", msgs)
+        if not testo:
+            print(f"[FU-RAPIDO] {chat_id}: SKIP dal modello"); return
+        await send_split_messages(int(chat_id), testo)
+        reg_set(chat_id, rapido_ts=datetime.now(pytz.UTC).isoformat())
+        print(f"[FU-RAPIDO] {chat_id} ({stato}, dopo {attesa // 60} min): {testo[:80]}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[FU-RAPIDO ERROR] {chat_id}: {e}")
 
 
 async def followup_registrazione(dry_run: bool = False) -> dict:
-    """Un giro di follow-up di accompagnamento per i lead E1. Chiamato ogni ora da n8n (9-23)."""
+    """Un giro di solleciti orari per i lead E1 fermi in registrazione. Chiamato ogni ora da n8n (9-23).
+    Tocco 1 (2h) e 2 (6h) a qualsiasi ora del giorno; dal tocco 3 solo nelle finestre 9-10 e 18-19.
+    Il sollecito rapido dei 10-15 minuti lo fa il main da solo (programma_fu_rapido) e non consuma tocchi."""
     now_it = datetime.now(ITALY_TZ); h = now_it.hour
     report = {"inviati": [], "skip": {}, "alert": []}
     if h < 9 or h >= 23:
@@ -1817,11 +1964,14 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         stato = r.get("stato")
         if stato not in SOGLIE_FU_REG or int(cid) in paused_leads or not e1_attivo(cid):
             continue
-        tocchi = int(r.get("tocchi", 0))
-        if tocchi >= 5:
+        tocchi = int(r.get("tocchi", 0) or 0)
+        soglie = SOGLIE_FU_REG[stato]
+        if tocchi >= len(soglie):
             continue
-        if tocchi > 0 and not finestra_piena:
+        if tocchi >= 2 and not finestra_piena:
             report["skip"][cid] = "fuori finestra"; continue
+        if pending_messages.get(int(cid)):
+            continue   # sta scrivendo adesso
         try:
             _, msgs = await read_chat_messages(int(cid), hours=24 * 14, limit=40)
         except Exception as e:
@@ -1829,7 +1979,7 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         if not msgs or not _is_our_sender(msgs[-1]["sender"]):
             continue   # il lead ha scritto per ultimo: risponde l'agent, non il follow-up
         ore = _ore_da(msgs[-1]["timestamp_iso"]) or 0
-        if ore < SOGLIE_FU_REG[stato][tocchi]:
+        if ore < soglie[tocchi]:
             continue
         if dry_run:
             report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "dry_run": True}); continue
@@ -1837,35 +1987,35 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
             # non ha risposto a "hai 10 minuti?": il link parte lo stesso, senza pressione
             if r.get("orario_dichiarato"):
                 continue   # ha detto quando: si aspetta l'agent al suo ritorno
+            nome = ""
+            try:
+                ent = await _get_entity_robusto(int(cid)); nome = getattr(ent, 'first_name', '') or ''
+            except Exception:
+                pass
             await send_split_messages(int(cid), "Intanto ti lascio qui il link, così quando hai 10 minuti lo fai e mi scrivi")
-            ok1 = await invia_template(int(cid), "link_registrazione")
-            await invia_template(int(cid), "tutorial_registrazione")
+            ok1 = await invia_template(int(cid), "link_registrazione", nome)
+            ok2 = await invia_template(int(cid), "tutorial_registrazione", nome)
             if ok1:
-                reg_set(cid, stato="link_inviato", tocchi=1)
+                reg_set(cid, stato="link_inviato", tocchi=0, rapido_ts="")
+                try:
+                    await notify_jack(f"🔗 LINK INVIATO (E1, dopo 2h di silenzio)\n\n👤 {nome or cid}\n\nNon aveva risposto a 'hai 10 minuti?': "
+                                      f"link{' e tutorial' if ok2 else ' (tutorial NON partito: mandalo tu)'} inviati lo stesso.\n👉 tg://user?id={cid}", topic="alert")
+                except Exception:
+                    pass
             report["inviati"].append({"chat_id": cid, "stato": "attesa_link->link_inviato", "tocco": 1}); continue
-        chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in msgs[-14:])
-        prompt = PROMPT_FU_REG.format(ore=int(ore), stato=stato, n=tocchi + 1, orario=r.get("orario_dichiarato") or "nessuno",
-                                      ora=now_it.strftime("%A %H:%M"), chat=chat_text)
-        testo = ""
+        n_sollecito = tocchi + 1 + (1 if r.get("rapido_ts") else 0)
         try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post("https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": "claude-sonnet-5", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
-                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    d = await resp.json(); testo = (d.get("content", [{}])[0].get("text") or "").strip().strip('"')
+            testo = await _genera_testo_fu_reg(int(cid), stato, min(n_sollecito, 5), f"{int(ore)} ore", msgs)
         except Exception as e:
             report["skip"][cid] = f"generazione fallita {e}"; continue
-        if not testo or testo.upper().startswith("SKIP"):
+        if not testo:
             report["skip"][cid] = "SKIP dal modello"; continue
-        testo = scarta_meta(ricuci_testo(normalizza_flag(estrai_msg(testo)[0])))
-        testo = re.sub(r'\[\s*[A-Z0-9_:]+\s*\]', '', testo).strip()[:400]
         await send_split_messages(int(cid), testo)
         reg_set(cid, tocchi=tocchi + 1)
         report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "testo": testo})
-        if tocchi + 1 >= 5:
+        if tocchi + 1 >= len(soglie):
             try:
-                await notify_jack(f"⏳ REGISTRAZIONE FERMA (E1)\n\nChat {cid}: stato {stato}, 5 tocchi senza risposta. Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
+                await notify_jack(f"⏳ REGISTRAZIONE FERMA (E1)\n\nChat {cid}: stato {stato}, {n_sollecito} solleciti senza risposta. Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
                 report["alert"].append(cid)
             except Exception:
                 pass
@@ -1914,7 +2064,8 @@ async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
             break
         if msg.text:
             if msg.out:
-                sender = "Agent" if msg.text.strip() in chat_agent_msgs else "Jack (manuale)"
+                _raw = (msg.message or "").strip()
+                sender = "Agent" if (msg.text.strip() in chat_agent_msgs or _raw in chat_agent_msgs) else "Jack (manuale)"
             else:
                 sender = getattr(entity, 'first_name', None) or "Lead"
             messages.append({"sender": sender, "text": msg.text, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
