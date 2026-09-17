@@ -124,9 +124,21 @@ TEMPLATE_KEYS = ("link_registrazione", "tutorial_registrazione", "tutorial_mt5",
 templates_salvati = {}   # key -> telethon Message dai "Messaggi salvati"
 
 
+# Id per cui la scorciatoia di test ("partiamo con 300, mandami il link") salta la vendita: SOLO i profili di prova.
+E1_SHORTCUT_IDS = {int(x) for x in os.environ.get("E1_SHORTCUT_IDS", "8611072693,740008603").replace(";", ",").split(",") if x.strip().isdigit()}
+
+
+def e1_ids_extra() -> set:
+    """Lead veri abilitati a E1 senza redeploy: '/e1 <id>' nel gruppo di controllo o GET /e1-add?chat_id=. Persistono nel volume."""
+    try:
+        return {int(x) for x in lead_state.get("e1_ids", [])}
+    except Exception:
+        return set()
+
+
 def e1_attivo(chat_id) -> bool:
     try:
-        return E1_ALL or int(chat_id) in E1_TEST_IDS
+        return E1_ALL or int(chat_id) in E1_TEST_IDS or int(chat_id) in e1_ids_extra()
     except Exception:
         return False
 
@@ -637,12 +649,12 @@ async def process_messages(sender_id, sender_info, debounce):
         await asyncio.sleep(3); extra += 3
     if extra:
         print(f"[DEBOUNCE] {sender_info.get('full_name')} stava scrivendo: atteso {extra}s in piu'")
-    if e1_attivo(sender_id) and reg_get(sender_id).get("stato") == "link_inviato":
-        reg_set(sender_id, stato="in_registrazione")
+    # (il passaggio link_inviato -> in_registrazione avviene su screenshot o su "sono partito", non su qualsiasi messaggio:
+    #  "lo faccio domani" non e' una registrazione iniziata)
 
     # SCORCIATOIA DI TEST (solo id in E1_TEST_IDS, mai per i lead veri): "partiamo con 300, mandami il link"
     # salta la vendita e innesca subito link + tutorial. Sparisce da sola quando E1_ALL=true.
-    if (not E1_ALL and int(sender_id) in E1_TEST_IDS and reg_get(sender_id).get("stato") not in STATI_REG):
+    if (not E1_ALL and int(sender_id) in E1_SHORTCUT_IDS and e1_attivo(sender_id) and reg_get(sender_id).get("stato") not in STATI_REG):
         _t = " ".join(m["text"] for m in pending_messages.get(sender_id, []) if m.get("media_type") in ("text", "screenshot")).lower()
         if re.search(r'partiamo con\s*\d+', _t) and 'link' in _t:
             print(f"[TEST] scorciatoia innesco E1 per {sender_id}")
@@ -661,9 +673,19 @@ async def process_messages(sender_id, sender_info, debounce):
     messages = pending_messages.pop(sender_id, [])
     pending_tasks.pop(sender_id, None)
     combined_text = "\n".join([m["text"] for m in messages if m.get("text")])
-    # E1: il lead ha scritto -> il conto dei solleciti riparte da zero (Jack riprende il ritmo da capo, non dal 4o tocco)
-    if e1_attivo(sender_id) and reg_get(sender_id).get("stato") in STATI_REG and int(reg_get(sender_id).get("tocchi", 0) or 0) > 0:
-        reg_set(sender_id, tocchi=0)
+    # E1: il lead ha scritto -> il conto dei solleciti riparte da zero e l'orario che aveva dichiarato non vale piu'
+    # (se ne dice uno nuovo, lo rimette la risposta dell'agent con [ORARIO:]). "Sono partito" = sta facendo la registrazione.
+    _r0 = reg_get(sender_id)
+    if e1_attivo(sender_id) and _r0.get("stato") in STATI_REG:
+        _agg = {}
+        if int(_r0.get("tocchi", 0) or 0) > 0:
+            _agg["tocchi"] = 0
+        if _r0.get("orario_dichiarato"):
+            _agg["orario_dichiarato"] = ""
+        if _r0.get("stato") == "link_inviato" and re.search(r"\b(partito|partita|sto facendo|inizio|comincio|sto registrando|mi registro|sto compilando|apro il conto)\b", combined_text.lower()):
+            _agg["stato"] = "in_registrazione"
+        if _agg:
+            reg_set(sender_id, **_agg)
     media_type = messages[-1].get("media_type", "text")
     print(f"[MSG IN] {sender_info['full_name']}: {combined_text[:100]}")
     # Carica storico chat Telethon se disponibile
@@ -731,7 +753,8 @@ async def process_messages(sender_id, sender_info, debounce):
                     # tranne: richiesta di chiamata/vocale, frasi di attesa "verifico", lead perso dopo i 2 tentativi.
                     _innesco = (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
                                 and reg_get(sender_id).get("stato") not in STATI_REG
-                                and not re.search(r'chiamata|videochiamata|vocale|verific|manager|ufficio|domattina|nessun problema|se in futuro|buona giornata|scrivimi', _rt_l))
+                                and (re.search(r'\blink\b|registr', _rt_l)
+                                     or not re.search(r'chiamata|videochiamata|vocale|verific|manager|ufficio|domattina|nessun problema|se in futuro|buona giornata|scrivimi', _rt_l)))
                     if _innesco:
                         scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
                         # Solo la domanda. Il link parte quando risponde (Agent 3) o dopo 2h di silenzio (follow-up).
@@ -815,6 +838,13 @@ async def process_messages(sender_id, sender_info, debounce):
                             f"🤔 RIPENSAMENTO (E1)\n\n👤 {sender_info['full_name']}\n\nDopo il link ha frenato. L'agent ha fatto una domanda leggera e si e' fermato.\n👉 {link_chat(sender_info, sender_id)}",
                             topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
 
+                    # Alert dedicato: il lead ha mandato le credenziali MT5 prima del deposito (Jack le vede in chat, l'agent continua)
+                    if re.search(r'\[\s*ALERT[_\s]*CREDENZIALI\s*\]', clean_reply, re.I):
+                        clean_reply = re.sub(r'\[\s*ALERT[_\s]*CREDENZIALI\s*\]', '', clean_reply, flags=re.I).strip()
+                        asyncio.create_task(notify_jack(
+                            f"🔑 CREDENZIALI MT5 IN CHAT (E1)\n\n👤 {sender_info['full_name']}\n\nHa mandato i dati del conto prima del deposito: li trovi in chat. "
+                            f"L'agent continua a seguirlo fino al deposito.\n👉 {_link}", topic="alert"))
+
                     # Alert dedicato: verifica cambio referral su conto AXI mai depositato
                     if '[ALERT_VERIFICA_REFERRAL]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_VERIFICA_REFERRAL]', '').strip()
@@ -885,6 +915,7 @@ async def process_messages(sender_id, sender_info, debounce):
                         'ALERT_CHIUSURA': re.compile(r'\[\s*ALERT[_\s]*CHIUSURA\s*\]', re.I),
                         'ALERT_DEPOSITO': re.compile(r'\[\s*ALERT[_\s]*DEPOSITO\s*\]', re.I),
                         'ALERT_VERIFICA_REFERRAL': re.compile(r'\[\s*ALERT[_\s]*VERIFICA[_\s]*REFERRAL\s*\]', re.I),
+                        'ALERT_CREDENZIALI': re.compile(r'\[\s*ALERT[_\s]*CREDENZIALI\s*\]', re.I),
                         'AUDIO_1': re.compile(r'\[\s*AUDIO[_\s]*1\s*\]', re.I),
                         'AUDIO_2': re.compile(r'\[\s*AUDIO[_\s]*2\s*\]', re.I),
                         'AUDIO_3': re.compile(r'\[\s*AUDIO[_\s]*3\s*\]', re.I),
@@ -1334,6 +1365,32 @@ async def handle_control(event):
                     await event.reply(f"Il lead {sender_id} non era in pausa")
             except ValueError:
                 await event.reply("Formato: riprendi [sender_id]")
+    elif text.startswith("/e1"):
+        parts = text.split()
+        ids = sorted(e1_ids_extra())
+        if len(parts) >= 2 and parts[1].isdigit():
+            cid = int(parts[1])
+            if cid not in ids:
+                lead_state["e1_ids"] = ids + [cid]; _salva_lead_state()
+            await event.reply(f"✅ E1 attivo per {cid}: dal prossimo messaggio l'agent lo accompagna fino al deposito.\nAttivi: {', '.join(str(x) for x in sorted(e1_ids_extra()))}")
+        elif len(parts) >= 3 and parts[1] in ("rimuovi", "togli", "off") and parts[2].isdigit():
+            cid = int(parts[2])
+            lead_state["e1_ids"] = [x for x in ids if x != cid]; lead_state.get("reg", {}).pop(str(cid), None); _salva_lead_state()
+            await event.reply(f"E1 tolto per {cid} (stato registrazione azzerato).")
+        elif len(parts) >= 4 and parts[1] == "stato" and parts[2].isdigit() and parts[3] in STATI_REG:
+            # lead a cui Jack ha gia' mandato il link a mano: "/e1 stato <id> link_inviato" e l'agent lo accompagna da li'
+            ids2 = sorted(e1_ids_extra())
+            if int(parts[2]) not in ids2:
+                lead_state["e1_ids"] = ids2 + [int(parts[2])]
+            reg_set(parts[2], stato=parts[3], tocchi=0, orario_dichiarato="", rapido_ts="")
+            await event.reply(f"Stato E1 di {parts[2]} = {parts[3]} (E1 attivo, solleciti azzerati).")
+        elif len(parts) >= 3 and parts[1] == "reset" and parts[2].isdigit():
+            prima = lead_state.get("reg", {}).pop(parts[2], None); paused_leads.discard(int(parts[2])); _salva_paused_leads(); _salva_lead_state()
+            await event.reply(f"Stato E1 di {parts[2]} azzerato (era {prima}).")
+        else:
+            attivi = "TUTTI (E1_ALL=true)" if E1_ALL else (", ".join(str(x) for x in sorted(E1_TEST_IDS | e1_ids_extra())) or "nessuno")
+            stati = "\n".join(f"- {c}: {r.get('stato')} (tocchi {r.get('tocchi', 0)})" for c, r in lead_state.get("reg", {}).items()) or "- nessuno in registrazione"
+            await event.reply(f"E1 attivo per: {attivi}\n\nUso: /e1 <id> attiva · /e1 rimuovi <id> · /e1 reset <id> · /e1 stato <id> link_inviato (se il link gliel'hai gia' mandato tu)\n(l'id e' il numero in tg://user?id=... negli alert)\n\nIn registrazione:\n{stati}")
     elif text.startswith("/stato"):
         me = await client.get_me()
         paused_list = ", ".join(str(x) for x in paused_leads) if paused_leads else "nessuno"
@@ -1868,7 +1925,7 @@ sollecito 4, FOMO vera e sobria: "Oggi il team ha gia' operato, ti aspettavo den
 sollecito 5, ultimo: "Dimmi se ti devo tenere il posto in community [nome], non mi hai piu' fatto sapere" (i posti nel VIP sono limitati e si aprono a scaglioni: e' vero e si puo' dire)
 
 REGOLE: massimo 2 righe, spesso una sola. Il nome davanti ai messaggi e' l'etichetta del profilo Telegram e NON vale: usa il nome SOLO se il lead lo ha scritto lui in un messaggio ("sono Marco"), e comunque non in tutti i solleciti. Un'emoji ogni tanto (💪 🤝 😊), non sempre. Niente punto finale. Riprendi dal punto esatto in cui si era fermato (se aveva un problema con la carta chiedi di quello, se stava attivando il bonus chiedi di quello, se aveva mandato uno screen di una pagina chiedi se e' andato avanti da li').
-VIETATO: numeri di guadagno, "siamo a profitto", percentuali, promesse, link, capitale, scadenze inventate, "fammi sapere" da solo, "senza fretta", "resto a disposizione". Non ripetere una frase gia' scritta nella chat (se "Sei riuscito?" c'e' gia', cambia). Se il lead ha detto chiaramente di non voler procedere, o e' in mezzo a un impegno serio che ha dichiarato (lavoro, emergenza, ferie, "lo faccio stasera/domani" e quel momento non e' ancora arrivato): SKIP.
+VIETATO: numeri di guadagno, "siamo a profitto", percentuali, promesse, link, capitale, scadenze inventate, "fammi sapere" da solo, "senza fretta", "resto a disposizione". Non ripetere una frase gia' scritta nella chat (se "Sei riuscito?" c'e' gia', cambia). Se il lead ha detto chiaramente di non voler procedere, o e' in mezzo a un impegno serio che ha dichiarato (lavoro, emergenza, ferie, "lo faccio stasera/domani" e quel momento non e' ancora arrivato), o ha fatto un bonifico e aspetta l'accredito (servono 24-48 ore lavorative: non sollecitare prima): SKIP.
 
 ULTIMI MESSAGGI:
 {chat}
@@ -1881,6 +1938,7 @@ Rispondi SOLO con il testo del messaggio (o SKIP), senza virgolette."""
 SOGLIE_FU_REG = {
     "attesa_link": [2], "link_inviato": [2, 6, 24, 48], "in_registrazione": [2, 6, 24, 48], "registrato": [2, 8, 24, 48],
 }
+SOGLIA_ATTESA_LINK_CON_ORARIO = 20   # "lo faccio stasera" e poi sparisce: dopo 20h il link parte lo stesso
 STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
 FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido
 FU_RAPIDO_PAUSA_ORE = 3                             # non piu' di un sollecito rapido ogni 3 ore per chat
@@ -1926,9 +1984,9 @@ async def _fu_rapido(chat_id, sender_info: dict):
         r = reg_get(chat_id); stato = r.get("stato")
         if stato not in STATI_FU_RAPIDO or chat_id in paused_leads or is_night_time():
             return
-        if pending_messages.get(chat_id):
+        if pending_messages.get(chat_id) or (time.time() - last_typing.get(chat_id, 0)) < 90:
             return   # sta scrivendo adesso: risponde l'agent
-        if stato == "link_inviato" and r.get("orario_dichiarato"):
+        if r.get("orario_dichiarato"):
             return   # ha detto quando lo fa: non si assilla
         ore_rapido = _ore_da(r.get("rapido_ts") or "")
         if ore_rapido is not None and ore_rapido < FU_RAPIDO_PAUSA_ORE:
@@ -1979,14 +2037,15 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         if not msgs or not _is_our_sender(msgs[-1]["sender"]):
             continue   # il lead ha scritto per ultimo: risponde l'agent, non il follow-up
         ore = _ore_da(msgs[-1]["timestamp_iso"]) or 0
-        if ore < soglie[tocchi]:
+        soglia = soglie[tocchi]
+        if stato == "attesa_link" and r.get("orario_dichiarato"):
+            soglia = SOGLIA_ATTESA_LINK_CON_ORARIO   # ha detto quando: si aspetta, ma non all'infinito
+        if ore < soglia:
             continue
         if dry_run:
             report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "dry_run": True}); continue
         if stato == "attesa_link":
-            # non ha risposto a "hai 10 minuti?": il link parte lo stesso, senza pressione
-            if r.get("orario_dichiarato"):
-                continue   # ha detto quando: si aspetta l'agent al suo ritorno
+            # non ha risposto a "hai 10 minuti?" (o aveva detto "stasera" ed e' sparito): il link parte lo stesso, senza pressione
             nome = ""
             try:
                 ent = await _get_entity_robusto(int(cid)); nome = getattr(ent, 'first_name', '') or ''
@@ -2043,6 +2102,19 @@ async def handle_reset_reg(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "chat_id": cid, "stato_precedente": prima})
 
 
+async def handle_e1_ids(request: web.Request) -> web.Response:
+    """GET /e1-add?chat_id=  /e1-remove?chat_id=  /e1-list — abilita E1 su un lead vero senza redeploy."""
+    cid = request.rel_url.query.get("chat_id", "")
+    ids = sorted(e1_ids_extra())
+    if request.path.endswith("e1-add") and cid.isdigit():
+        if int(cid) not in ids:
+            lead_state["e1_ids"] = ids + [int(cid)]; _salva_lead_state()
+    elif request.path.endswith("e1-remove") and cid.isdigit():
+        lead_state["e1_ids"] = [x for x in ids if x != int(cid)]; lead_state.get("reg", {}).pop(cid, None); _salva_lead_state()
+    return web.json_response({"ok": True, "e1_all": E1_ALL, "env_ids": sorted(E1_TEST_IDS), "extra_ids": sorted(e1_ids_extra()),
+                              "reg": lead_state.get("reg", {})})
+
+
 async def handle_reload_templates(request: web.Request) -> web.Response:
     """GET /reload-templates — rilegge i messaggi salvati (dopo che Jack li ha modificati)."""
     return web.json_response({"ok": True, "templates": await carica_template_salvati()})
@@ -2075,6 +2147,16 @@ async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
             audio_key = chat_sent_audios.get(msg.id)
             etichetta = f"[VOCALE GIA' INVIATO: {audio_key}]" if audio_key else "[VOCALE GIA' INVIATO]"
             messages.append({"sender": "Agent", "text": etichetta, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
+            continue
+        # Media del lead senza testo: l'agent deve vederli nello storico (quanti screen ha mandato, se ha mandato un vocale)
+        if not msg.out and msg.media is not None:
+            if isinstance(msg.media, MessageMediaPhoto):
+                etichetta = "[screenshot inviato]"
+            elif getattr(msg, 'voice', None):
+                etichetta = "[vocale inviato]"
+            else:
+                etichetta = "[file inviato]"
+            messages.append({"sender": getattr(entity, 'first_name', None) or "Lead", "text": etichetta, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
     messages.reverse()
     return entity, messages
 
@@ -2496,6 +2578,9 @@ async def start_http_server():
     app.router.add_post("/move-to-folder", handle_move_to_folder)
     app.router.add_get("/reload-templates", handle_reload_templates)
     app.router.add_get("/reset-reg", handle_reset_reg)
+    app.router.add_get("/e1-add", handle_e1_ids)
+    app.router.add_get("/e1-remove", handle_e1_ids)
+    app.router.add_get("/e1-list", handle_e1_ids)
     app.router.add_get("/registrazione-followup", handle_followup_registrazione)
     app.router.add_post("/registrazione-followup", handle_followup_registrazione)
     app.router.add_get("/reconcile-folders",  handle_reconcile_folders)
