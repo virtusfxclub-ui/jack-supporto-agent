@@ -182,7 +182,7 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            for k in ("rientri", "cache", "fu", "reg", "rinvii"): d.setdefault(k, {})
+            for k in ("rientri", "cache", "fu", "reg", "rinvii", "agent_msgs", "audio_ids"): d.setdefault(k, {})
             return d
     except Exception:
         return {"rientri": {}, "cache": {}, "fu": {}, "reg": {}}
@@ -198,12 +198,56 @@ def _salva_lead_state():
 
 lead_state = _carica_lead_state()
 agent_messages   = {}
+
+
+def ricorda_msg_agent(chat_id, testo: str):
+    """Segna un testo come mandato dall'agent (per distinguerlo da Jack manuale nello storico).
+    In memoria E sul volume: dopo un riavvio lo storico deve restare corretto, altrimenti l'agent legge
+    i propri messaggi come 'Jack (manuale)' e il sistema perde il filo (ponte gia' mandato, vocali, ecc.)."""
+    t = (testo or "").strip()
+    if not t:
+        return
+    lst = agent_messages.setdefault(chat_id, [])
+    lst.append(t)
+    if len(lst) > 200:
+        del lst[:-200]
+    try:
+        lead_state.setdefault("agent_msgs", {})[str(chat_id)] = lst[-200:]
+        _salva_lead_state()
+    except Exception as e:
+        print(f"[STATE] agent_msgs non salvato: {e}")
+
+
+def ricorda_audio(chat_id, msg_id, audio_key: str):
+    sent_audios.setdefault(chat_id, {})[msg_id] = audio_key
+    try:
+        lead_state.setdefault("audio_ids", {})[str(chat_id)] = {str(k): v for k, v in sent_audios[chat_id].items()}
+        _salva_lead_state()
+    except Exception as e:
+        print(f"[STATE] audio_ids non salvato: {e}")
+
+
+def _ripristina_memoria_agent():
+    """All'avvio: rilegge dal volume i messaggi/vocali mandati dall'agent."""
+    n = 0
+    for k, v in (lead_state.get("agent_msgs") or {}).items():
+        try:
+            agent_messages[int(k)] = list(v)[-200:]; n += len(v)
+        except Exception:
+            pass
+    for k, v in (lead_state.get("audio_ids") or {}).items():
+        try:
+            sent_audios[int(k)] = {int(mid): key for mid, key in v.items()}
+        except Exception:
+            pass
+    print(f"[STATE] memoria agent ripristinata: {len(agent_messages)} chat, {n} messaggi")
 folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
 # Traccia i vocali inviati per chat: {chat_id: {message_id: audio_key}}
 # Serve perche' i vocali non hanno testo e senza questo non comparirebbero nello storico
 # letto dall'agent, che finirebbe per rimandare lo stesso audio due volte.
 sent_audios = {}
+_ripristina_memoria_agent()
 
 # Libreria audio — nome chiave (usato nei flag [AUDIO_1]..[AUDIO_3]) -> URL raw GitHub
 AUDIO_LIBRARY = {
@@ -652,17 +696,11 @@ async def send_split_messages(chat_id, text):
         except Exception:
             await asyncio.sleep(typing_time)
         await client.send_message(chat_id, part)
-        # Traccia questo messaggio come inviato dall'agent
-        if chat_id not in agent_messages:
-            agent_messages[chat_id] = []
-        agent_messages[chat_id].append(part.strip())
-        # Mantieni solo gli ultimi 200 messaggi per chat per non occupare troppa memoria
-        if len(agent_messages[chat_id]) > 200:
-            agent_messages[chat_id] = agent_messages[chat_id][-200:]
+        ricorda_msg_agent(chat_id, part)
         if i < len(parts) - 1:
             # pausa "di lettura" tra un messaggio e l'altro (il typing del prossimo si aggiunge)
             await asyncio.sleep(random.uniform(1.5, 4.0))
-async def process_messages(sender_id, sender_info, debounce):
+async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool = False):
     await asyncio.sleep(debounce)
     # Se il lead sta ancora scrivendo, aspetto che smetta (max TYPING_MAX_EXTRA): cosi' rispondo a tutto in una volta
     # invece di dare due risposte separate a un messaggio spezzato in due.
@@ -772,6 +810,25 @@ async def process_messages(sender_id, sender_info, debounce):
                     # fisso di Jack; il modello puo' aggiungere al massimo una frase di conferma del capitale.
                     # [ESCALATION] NON innesca piu' nulla: e' solo "chiudi tu" (pausa + alert), anche con E1 attivo.
                     if re.search(r'\[\s*PRONTO\s*\]', reply_text, re.I) and reg_get(sender_id).get("stato") not in STATI_REG:
+                        # Il ponte si manda UNA volta sola. Se e' gia' partito (E1 era spento, Jack ha ripreso l'agent,
+                        # riavvio...), un secondo [PRONTO] non lo ripete: il lead ha gia' risposto al ponte.
+                        _ponte_ore = _ore_da(reg_get(sender_id).get("ponte_ts") or "")
+                        if _ponte_ore is not None and _ponte_ore < 24 * 7:
+                            _l = link_chat(sender_info, sender_id)
+                            if e1_attivo(sender_id) and not _rientro_a3:
+                                # riparte il turno con l'Agent 3 in attesa_link: e' lui a mandare il link su un si'
+                                reg_set(sender_id, stato="attesa_link", orario_dichiarato="", tocchi=0, rapido_ts="")
+                                print(f"[PRONTO] ponte gia' mandato a {sender_id}: rifaccio il turno con l'Agent 3")
+                                pending_messages[sender_id] = messages
+                                await process_messages(sender_id, sender_info, 0, _rientro_a3=True)
+                            else:
+                                paused_leads.add(sender_id); _salva_paused_leads()
+                                asyncio.create_task(notify_jack(
+                                    f"🟢 LEAD PRONTO - CHIUDI TU\n\n👤 {sender_info['full_name']}\n\nIl ponte gli era gia' stato mandato, non lo ripeto. "
+                                    f"Manda tu il link, oppure premi Riprendi agent: l'agent continua lui con la registrazione (E1 si attiva da solo per questo lead).\n"
+                                    f"⏸ Agent in pausa su questa chat.\n👉 {_l}",
+                                    topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
+                            return
                         testo_conferma = reply_text[7:] if reply_text.startswith("[PAUSE]") else reply_text
                         testo_conferma = _RE_FLAG_GLOBAL.sub('', testo_conferma)
                         testo_conferma = re.sub(r'\[\s*[A-Z0-9_]{2,30}\s*\]', '', testo_conferma).strip()
@@ -785,6 +842,7 @@ async def process_messages(sender_id, sender_info, debounce):
                         await send_split_messages(sender_id, BRIDGE_INNESCO)
                         annulla_fu_rapido(sender_id)
                         _l = link_chat(sender_info, sender_id)
+                        reg_set(sender_id, ponte_ts=datetime.now(pytz.UTC).isoformat())
                         if e1_attivo(sender_id):
                             reg_set(sender_id, stato="attesa_link", scelta=scelta, orario_dichiarato="", tocchi=0, rapido_ts="")
                             asyncio.create_task(notify_jack(
@@ -795,7 +853,7 @@ async def process_messages(sender_id, sender_info, debounce):
                             paused_leads.add(sender_id); _salva_paused_leads()
                             asyncio.create_task(notify_jack(
                                 f"🟢 LEAD PRONTO - CHIUDI TU (E1 non attivo)\n\n👤 {sender_info['full_name']}\n\nObiezioni chiuse e capitale concordato. Gli ho scritto: "
-                                f"\"{BRIDGE_INNESCO}\"\nManda tu link e tutorial e seguilo (oppure /e1 {sender_id} e Riprendi agent per farlo seguire dall'agent).\n"
+                                f"\"{BRIDGE_INNESCO}\"\nManda tu link e tutorial e seguilo. Oppure premi Riprendi agent: la registrazione la segue lui (E1 si attiva da solo per questo lead).\n"
                                 f"⏸ Agent in pausa su questa chat.\n👉 {_l}",
                                 topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
                         print(f"[PRONTO] innesco per {sender_info['full_name']} (E1={'si' if e1_attivo(sender_id) else 'no'})")
@@ -1057,7 +1115,7 @@ async def process_messages(sender_id, sender_info, debounce):
                                     # registra quale audio e' stato mandato, per renderlo visibile nello storico
                                     try:
                                         if sent_msg is not None:
-                                            sent_audios.setdefault(sender_id, {})[sent_msg.id] = audio_key_to_send
+                                            ricorda_audio(sender_id, sent_msg.id, audio_key_to_send)
                                     except Exception:
                                         pass
                                     print(f"[AUDIO] {audio_key_to_send} inviato a {sender_info['full_name']} (delay {record_delay:.1f}s)")
@@ -1581,6 +1639,14 @@ async def handle_resume_lead(request: web.Request) -> web.Response:
         if reg_get(chat_id).get("stato") == "ripensamento":
             lead_state["reg"].pop(str(chat_id), None); _salva_lead_state()
             print(f"[STATO] {chat_id}: ripensamento azzerato al Riprendi, torna in trattativa")
+        _r = reg_get(chat_id); _ponte_ore = _ore_da(_r.get("ponte_ts") or "")
+        e1_acceso = False
+        if _ponte_ore is not None and _ponte_ore < 24 * 7 and _r.get("stato") not in STATI_REG:
+            # il ponte e' gia' partito: da qui in poi tocca all'Agent 3, non all'Agent 1 che rivende
+            if not e1_attivo(chat_id):
+                lead_state["e1_ids"] = sorted(set(e1_ids_extra()) | {int(chat_id)}); e1_acceso = True
+            reg_set(chat_id, stato="attesa_link", orario_dichiarato="", tocchi=0, rapido_ts="")
+            print(f"[RESUME] {chat_id}: ponte gia' mandato -> attesa_link (E1 {'attivato' if e1_acceso else 'gia attivo'})")
         _salva_paused_leads()
         print(f"[RESUME] Lead {chat_id} riattivato (era in pausa: {era_in_pausa})")
 
@@ -1596,6 +1662,9 @@ async def handle_resume_lead(request: web.Request) -> web.Response:
             _l = f"tg://user?id={chat_id}"
             if era_in_pausa:
                 testo = f"🟢 ATTIVO\n\n{nome or chat_id} — agent riattivato, risponderà al prossimo messaggio.\n\n👉 Apri la chat: {_l}"
+                if reg_get(chat_id).get("stato") == "attesa_link":
+                    testo = (f"🟢 ATTIVO\n\n{nome or chat_id} — il ponte gli era gia' stato mandato: da qui segue la registrazione l'agent"
+                             f"{' (E1 attivato per questo lead)' if e1_acceso else ''}. Il link parte quando risponde di si'.\n\n👉 Apri la chat: {_l}")
             else:
                 testo = f"ℹ️ {nome or chat_id} non risultava in pausa (probabile riavvio del sistema nel frattempo). L'agent è già attivo su questo lead."
             asyncio.create_task(notify_jack(testo, topic="alert"))
@@ -1710,7 +1779,7 @@ async def handle_send_audio(request: web.Request) -> web.Response:
             sent_msg = await client.send_file(chat_id, tmp_path, voice_note=True)
             try:
                 if sent_msg is not None:
-                    sent_audios.setdefault(chat_id, {})[sent_msg.id] = audio_key
+                    ricorda_audio(chat_id, sent_msg.id, audio_key)
             except Exception:
                 pass
             print(f"[AUDIO] Inviato {audio_key} a {chat_id}")
@@ -1958,7 +2027,7 @@ async def invia_template(chat_id: int, key: str, nome_lead: str = "") -> bool:
                 await client.send_message(chat_id, testo, formatting_entities=ent, link_preview=True)
         else:
             await client.send_message(chat_id, testo, formatting_entities=ent, file=allegato, link_preview=True)
-        agent_messages.setdefault(chat_id, []).append(testo.strip())
+        ricorda_msg_agent(chat_id, testo)
         return True
 
     ultimo_errore = ""
