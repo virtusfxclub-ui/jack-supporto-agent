@@ -6,7 +6,7 @@ import json
 import re
 import tempfile
 from aiohttp import web
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -182,7 +182,7 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            for k in ("rientri", "cache", "fu", "reg", "rinvii", "agent_msgs", "audio_ids"): d.setdefault(k, {})
+            for k in ("rientri", "cache", "fu", "reg", "rinvii", "agent_msgs", "audio_ids", "appuntamenti"): d.setdefault(k, {})
             return d
     except Exception:
         return {"rientri": {}, "cache": {}, "fu": {}, "reg": {}}
@@ -737,6 +737,7 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
     # (se ne dice uno nuovo, lo rimette la risposta dell'agent con [ORARIO:]). "Sono partito" = sta facendo la registrazione.
     if str(sender_id) in lead_state.get("rinvii", {}):
         lead_state["rinvii"].pop(str(sender_id), None); _salva_lead_state()
+    annulla_appuntamento(sender_id)
     _r0 = reg_get(sender_id)
     if e1_attivo(sender_id) and _r0.get("stato") in STATI_REG:
         _agg = {}
@@ -923,6 +924,7 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                     if m_rv:
                         lead_state.setdefault("rinvii", {})[str(sender_id)] = {"quando": m_rv.group(1).strip(), "ts": datetime.now(pytz.UTC).isoformat()}
                         _salva_lead_state()
+                        programma_appuntamento(sender_id, m_rv.group(1).strip(), "rinvio", sender_info)
                         asyncio.create_task(notify_jack(
                             f"📅 RINVIO\n\n👤 {sender_info['full_name']}\n\nHa rimandato: \"{m_rv.group(1).strip()}\". Niente link, l'agent riprende quando riscrive; i follow-up aspettano la data.\n👉 {_link}",
                             topic="alert"))
@@ -1086,6 +1088,8 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                     m_or = re.search(r'\[\s*ORARIO\s*:\s*([^\]]{2,40})\]', reply_text, re.I)
                     if m_or and e1_attivo(sender_id):
                         reg_set(sender_id, orario_dichiarato=m_or.group(1).strip())
+                        _st = reg_get(sender_id).get("stato")
+                        programma_appuntamento(sender_id, m_or.group(1).strip(), "deposito" if _st == "registrato" else ("registrazione" if _st in ("link_inviato", "in_registrazione") else "attesa_link"), sender_info)
 
                     if audio_key_to_send:
                         try:
@@ -2129,6 +2133,214 @@ def annulla_fu_rapido(chat_id):
         t.cancel()
 
 
+# =====================================================================================
+# APPUNTAMENTI (v37): "tra 5 minuti", "alle 15", "stasera", "domani mattina", "lunedì", "il 27".
+# Quando il lead dice QUANDO, all'ora detta scrive l'agent (come farebbe Jack), non si aspetta che riscriva lui.
+# L'orario viene dal flag [ORARIO: ...] (Agent 3) o [RINVIO: ...] (Agent 1). Se non si capisce, non succede nulla
+# (restano i follow-up normali). Gli appuntamenti sono salvati sul volume e ripartono dopo un riavvio.
+# =====================================================================================
+_GIORNI = {"lunedi": 0, "lunedì": 0, "martedi": 1, "martedì": 1, "mercoledi": 2, "mercoledì": 2, "giovedi": 3, "giovedì": 3,
+           "venerdi": 4, "venerdì": 4, "sabato": 5, "domenica": 6}
+_MESI = {"gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6, "luglio": 7, "agosto": 8,
+         "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12}
+APPUNTAMENTO_MAX_GIORNI = 45      # oltre non si programma nulla (ci pensano i follow-up)
+
+
+def parse_orario(testo: str, now=None):
+    """Testo del lead/agent -> datetime (Italia) dell'appuntamento, o None se non e' un momento preciso.
+    Gestisce: tra N minuti/ore, alle HH[:MM], stasera, stanotte, domani[ mattina|pomeriggio|sera], domattina,
+    dopo pranzo/cena, oggi pomeriggio, nel pomeriggio, giorni della settimana, 'il 27', '27 settembre', fine mese."""
+    t = (testo or "").strip().lower().replace("’", "'")
+    if not t:
+        return None
+    now = now or datetime.now(ITALY_TZ)
+    if t in ("nessuno", "adesso", "ora", "subito"):
+        return None
+    m = re.search(r"\btra\s+(?:un[']?|una\s+)?(\d+)?\s*(minut|min\b|or[ae]\b|mezz)", t)
+    if m:
+        n = int(m.group(1) or 1)
+        if m.group(2).startswith("mezz"):
+            return now + timedelta(minutes=30)
+        return now + timedelta(minutes=n) if m.group(2).startswith("min") else now + timedelta(hours=n)
+    if re.search(r"\btra un'?\s*ora\b", t):
+        return now + timedelta(hours=1)
+    # ora esplicita: "alle 15", "alle 15:30", "per le 21", "15.30"
+    ora = None
+    m = re.search(r"\b(?:alle|per le|verso le|entro le|le)\s*(\d{1,2})(?:[:.](\d{2}))?\b", t) or re.search(r"\b(\d{1,2})[:.](\d{2})\b", t)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2) or 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            if hh <= 7 and ("pomeriggio" in t or "sera" in t or "stasera" in t or (hh <= 6 and "notte" not in t and "mattin" not in t)):
+                hh += 12   # "alle 3" nel pomeriggio -> 15
+            ora = (hh, mm)
+    # giorno
+    giorno = now.date()
+    if "domattina" in t or "domani mattina" in t:
+        giorno = giorno + timedelta(days=1); ora = ora or (9, 30)
+    elif "domani pomeriggio" in t:
+        giorno = giorno + timedelta(days=1); ora = ora or (15, 30)
+    elif "domani sera" in t:
+        giorno = giorno + timedelta(days=1); ora = ora or (20, 30)
+    elif "domani" in t:
+        giorno = giorno + timedelta(days=1); ora = ora or (10, 0)
+    elif "dopodomani" in t:
+        giorno = giorno + timedelta(days=2); ora = ora or (10, 0)
+    elif "stasera" in t or "questa sera" in t or "in serata" in t:
+        ora = ora or (20, 30)
+    elif "stanotte" in t:
+        ora = ora or (23, 0)
+    elif "dopo pranzo" in t:
+        ora = ora or (14, 30)
+    elif "dopo cena" in t:
+        ora = ora or (21, 30)
+    elif "pomeriggio" in t:
+        ora = ora or (15, 30)
+    elif "fine mese" in t or "fine del mese" in t:
+        ultimo = (giorno.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        giorno = ultimo if ultimo > giorno else ((ultimo + timedelta(days=1)).replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        ora = ora or (10, 0)
+    else:
+        mg = re.search(r"\b(luned[iì]|marted[iì]|mercoled[iì]|gioved[iì]|venerd[iì]|sabato|domenica)\b", t)
+        md = re.search(r"\b(?:il|del|dal|entro il)?\s*(\d{1,2})\s*(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)?\b", t) if not m else None
+        if mg:
+            wd = _GIORNI[mg.group(1)]; delta = (wd - giorno.weekday()) % 7
+            if delta == 0 and (ora is None or now.replace(hour=ora[0], minute=ora[1]) <= now):
+                delta = 7
+            giorno = giorno + timedelta(days=delta); ora = ora or (10, 0)
+        elif md and md.group(1) and 1 <= int(md.group(1)) <= 31 and (md.group(2) or re.search(r"\b(il|del|entro il)\s*\d{1,2}\b", t)):
+            d = int(md.group(1)); mese = _MESI[md.group(2)] if md.group(2) else giorno.month
+            anno = giorno.year
+            try:
+                cand = giorno.replace(year=anno, month=mese, day=d)
+            except ValueError:
+                return None
+            if cand < giorno:
+                mese = mese + 1 if md.group(2) is None else mese
+                if mese > 12: mese, anno = 1, anno + 1
+                if md.group(2) is not None: anno += 1
+                try:
+                    cand = cand.replace(year=anno, month=mese, day=d)
+                except ValueError:
+                    return None
+            giorno = cand; ora = ora or (10, 0)
+        elif ora is None:
+            return None
+    if ora is None:
+        return None
+    dt = ITALY_TZ.localize(datetime(giorno.year, giorno.month, giorno.day, ora[0], ora[1]))
+    if dt <= now and giorno == now.date():
+        dt = dt + timedelta(days=1)      # "alle 9" detto alle 21 = domani alle 9; "dopo pranzo" detto la sera = domani
+    if dt <= now or (dt - now) > timedelta(days=APPUNTAMENTO_MAX_GIORNI):
+        return None
+    return dt
+
+
+appuntamenti_task = {}
+
+
+def programma_appuntamento(chat_id, quando_txt: str, tipo: str, sender_info: dict = None):
+    """Registra l'appuntamento (sul volume) e avvia il timer. tipo: 'attesa_link' | 'registrazione' | 'deposito' | 'rinvio'."""
+    dt = parse_orario(quando_txt)
+    if not dt:
+        print(f"[APPUNTAMENTO] {chat_id}: '{quando_txt}' non e' un momento preciso, nessun timer"); return None
+    lead_state.setdefault("appuntamenti", {})[str(chat_id)] = {
+        "quando": dt.isoformat(), "tipo": tipo, "testo": quando_txt, "ts": datetime.now(pytz.UTC).isoformat(),
+        "nome": (sender_info or {}).get("full_name", ""), "username": (sender_info or {}).get("username", "")}
+    _salva_lead_state()
+    _avvia_timer_appuntamento(chat_id)
+    print(f"[APPUNTAMENTO] {chat_id}: '{quando_txt}' -> {dt.strftime('%d/%m %H:%M')} ({tipo})")
+    return dt
+
+
+def annulla_appuntamento(chat_id):
+    t = appuntamenti_task.pop(int(chat_id), None)
+    if t is not None and not t.done():
+        t.cancel()
+    if str(chat_id) in lead_state.get("appuntamenti", {}):
+        lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state()
+
+
+def _avvia_timer_appuntamento(chat_id):
+    chat_id = int(chat_id)
+    t = appuntamenti_task.pop(chat_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+    appuntamenti_task[chat_id] = asyncio.create_task(_appuntamento(chat_id))
+
+
+def _ripristina_appuntamenti():
+    n = 0
+    for cid, a in list((lead_state.get("appuntamenti") or {}).items()):
+        try:
+            if datetime.fromisoformat(a["quando"]) < datetime.now(ITALY_TZ) - timedelta(hours=6):
+                lead_state["appuntamenti"].pop(cid, None); continue
+            _avvia_timer_appuntamento(int(cid)); n += 1
+        except Exception:
+            lead_state["appuntamenti"].pop(cid, None)
+    _salva_lead_state()
+    print(f"[APPUNTAMENTO] ripristinati {n} timer")
+
+
+TESTI_APPUNTAMENTO = {
+    "attesa_link": "Eccoci! Hai 10 minuti ora? Ti giro il link e facciamo la registrazione assieme",
+    "registrazione": "Eccoci! Riusciamo a farla ora? Se ti blocchi da qualche parte mandami uno screen, ci sono io",
+    "deposito": "Ciao! Come detto oggi partiamo: riesci a fare il deposito così ti attivo subito il VIP?",
+}
+
+
+async def _appuntamento(chat_id):
+    try:
+        a = (lead_state.get("appuntamenti") or {}).get(str(chat_id))
+        if not a:
+            return
+        dt = datetime.fromisoformat(a["quando"])
+        attesa = (dt - datetime.now(ITALY_TZ)).total_seconds()
+        if attesa > 0:
+            await asyncio.sleep(attesa)
+        # e' l'ora: ha senso ancora?
+        a = (lead_state.get("appuntamenti") or {}).get(str(chat_id))
+        if not a or chat_id in paused_leads:
+            return
+        while is_night_time():
+            await asyncio.sleep(300)
+        _, msgs = await read_chat_messages(int(chat_id), hours=24 * 3, limit=30)
+        ts_app = datetime.fromisoformat(a["ts"])
+        # se il lead ha scritto dopo aver fissato l'appuntamento, ci ha gia' pensato l'agent: niente messaggio
+        if msgs and any((not _is_our_sender(m["sender"])) and datetime.fromisoformat(m["timestamp_iso"]) > ts_app for m in msgs):
+            lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state(); return
+        if pending_messages.get(int(chat_id)):
+            return
+        tipo = a.get("tipo"); r = reg_get(chat_id); stato = r.get("stato")
+        info = {"full_name": a.get("nome") or str(chat_id), "username": a.get("username") or "", "first_name": ""}
+        if tipo == "rinvio":
+            # aveva rimandato la registrazione a una data: all'ora detta parte il ponte (o Jack, se E1 e' spento)
+            if stato in STATI_REG:
+                return
+            if e1_attivo(chat_id):
+                await send_split_messages(int(chat_id), "Eccomi come promesso! " + BRIDGE_INNESCO)
+                reg_set(chat_id, stato="attesa_link", ponte_ts=datetime.now(pytz.UTC).isoformat(), orario_dichiarato="", tocchi=0, rapido_ts="")
+                await notify_jack(f"📅 APPUNTAMENTO ({a.get('testo')})\n\n👤 {info['full_name']}\n\nAll'ora detta gli ho mandato il ponte. Il link parte quando risponde di si'.\n👉 {link_chat(info, chat_id)}", topic="alert")
+            else:
+                await notify_jack(f"📅 APPUNTAMENTO ({a.get('testo')})\n\n👤 {info['full_name']}\n\nAveva rimandato a questo momento e E1 non e' attivo: scrivigli tu.\n👉 {link_chat(info, chat_id)}", topic="alert")
+        else:
+            if stato == "attesa_link":
+                testo = TESTI_APPUNTAMENTO["attesa_link"]
+            elif stato in ("link_inviato", "in_registrazione"):
+                testo = TESTI_APPUNTAMENTO["registrazione"]
+            elif stato == "registrato":
+                testo = TESTI_APPUNTAMENTO["deposito"]
+            else:
+                lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state(); return
+            await send_split_messages(int(chat_id), testo)
+            reg_set(chat_id, orario_dichiarato="", rapido_ts=datetime.now(pytz.UTC).isoformat())
+            await notify_jack(f"📅 APPUNTAMENTO ({a.get('testo')})\n\n👤 {info['full_name']}\n\nAll'ora detta l'agent gli ha scritto: \"{testo}\"\n👉 {link_chat(info, chat_id)}", topic="alert")
+        lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[APPUNTAMENTO ERROR] {chat_id}: {e}")
+
+
 def programma_fu_rapido(chat_id, sender_info: dict):
     """Dopo una nostra risposta in fase di registrazione: se il lead resta fermo 10-15 minuti, un sollecito leggero
     ("Sei riuscito a registrarti?"). Come fa Jack. Si annulla da solo se il lead scrive prima."""
@@ -2202,6 +2414,9 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         soglia = soglie[tocchi]
         if stato == "attesa_link" and r.get("orario_dichiarato"):
             soglia = max(soglia, SOGLIA_ATTESA_LINK_CON_ORARIO)   # ha detto quando: si aspetta, ma non all'infinito
+        _app = (lead_state.get("appuntamenti") or {}).get(cid)
+        if _app and datetime.fromisoformat(_app["quando"]) > now_it:
+            report["skip"][cid] = "appuntamento futuro"; continue   # ha detto quando: si scrive a quell'ora, non prima
         if ore < soglia:
             continue
         if dry_run:
@@ -2836,6 +3051,7 @@ async def main():
         print(f"[WARN] {e}")
     http_runner = await start_http_server()
     asyncio.create_task(webhook_guardian())
+    _ripristina_appuntamenti()
     try:
         await client.run_until_disconnected()
     finally:
