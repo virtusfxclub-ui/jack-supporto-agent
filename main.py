@@ -166,7 +166,7 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            for k in ("rientri", "cache", "fu", "reg"): d.setdefault(k, {})
+            for k in ("rientri", "cache", "fu", "reg", "rinvii"): d.setdefault(k, {})
             return d
     except Exception:
         return {"rientri": {}, "cache": {}, "fu": {}, "reg": {}}
@@ -499,7 +499,13 @@ def normalizza_flag(text: str) -> str:
     return re.sub(r'\[\s*([A-Za-z0-9_\s]{1,40}?)\s*\]', _fix, text)
 
 
-_RE_FLAG_GLOBAL = re.compile(r'\[\s*(?:ESCALATION|NOTIFICA[_\s]*JACK|AGENT[_\s]*2|AUDIO[_\s]*\d|ALERT_[A-Z_]+|DOC:[a-z_]+|ORARIO:[^\]]*|PAUSE|SCREENSHOT:[^\]]*)\s*\]', re.I)
+_RE_FLAG_GLOBAL = re.compile(r'\[\s*(?:ESCALATION|NOTIFICA[_\s]*JACK|AGENT[_\s]*2|AUDIO[_\s]*\d|ALERT_[A-Z_]+|DOC:[a-z_]+|ORARIO:[^\]]*|PAUSE|SCREENSHOT:[^\]]*|PRONTO|RINVIO:[^\]]*)\s*\]', re.I)
+
+# Ponte dell'innesco (testo di Jack). Lo manda il main quando l'Agent 1/2 scrive [PRONTO]: il modello non lo scrive mai da solo.
+# Chiede se ci sono altre domande PRIMA del link: se resta un dubbio esce qui, non dopo il link.
+BRIDGE_INNESCO = "Allora ti giro il link per la registrazione su AXI e procediamo assieme, ti seguo io passo passo 💪 Hai altre domande o hai 10 minuti adesso per registrarti?"
+# Il modello con [PRONTO] puo' scrivere al massimo una frase di conferma del capitale: se prova a fare lui il ponte, il suo testo si scarta.
+_RE_TESTO_PRONTO_VIETATO = re.compile(r'link|registr|10 minuti|un attimo|un secondo|ti giro|ti mando|passo passo', re.I)
 
 
 def estrai_msg(text: str):
@@ -659,8 +665,8 @@ async def process_messages(sender_id, sender_info, debounce):
         if re.search(r'partiamo con\s*\d+', _t) and 'link' in _t:
             print(f"[TEST] scorciatoia innesco E1 per {sender_id}")
             pending_messages.pop(sender_id, None)
-            await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
-            reg_set(sender_id, stato="attesa_link", scelta="copy", orario_dichiarato="", tocchi=0)
+            await send_split_messages(sender_id, BRIDGE_INNESCO)
+            reg_set(sender_id, stato="attesa_link", scelta="copy", orario_dichiarato="", tocchi=0, rapido_ts="")
             asyncio.create_task(notify_jack(f"🔗 INNESCO E1 (scorciatoia test)\n\n👤 {sender_info['full_name']}\n👉 {link_chat(sender_info, sender_id)}", topic="alert"))
             return
     if sender_id in paused_leads:
@@ -675,6 +681,8 @@ async def process_messages(sender_id, sender_info, debounce):
     combined_text = "\n".join([m["text"] for m in messages if m.get("text")])
     # E1: il lead ha scritto -> il conto dei solleciti riparte da zero e l'orario che aveva dichiarato non vale piu'
     # (se ne dice uno nuovo, lo rimette la risposta dell'agent con [ORARIO:]). "Sono partito" = sta facendo la registrazione.
+    if str(sender_id) in lead_state.get("rinvii", {}):
+        lead_state["rinvii"].pop(str(sender_id), None); _salva_lead_state()
     _r0 = reg_get(sender_id)
     if e1_attivo(sender_id) and _r0.get("stato") in STATI_REG:
         _agg = {}
@@ -743,26 +751,38 @@ async def process_messages(sender_id, sender_info, debounce):
                         _salva_paused_leads()
                         print(f"[BLOCKED] {sender_info['full_name']} bloccato")
                         return
-                    # E1 — INNESCO: Agent 1 chiude con "ti giro il link" + ESCALATION. Se E1 e' attivo per questa chat
-                    # e non e' gia' in registrazione, invece della pausa: link + tutorial + "Dimmi pure quando parti!"
-                    # Innesco = ESCALATION di Agent 1 quando la chat e' allo step del capitale/registrazione.
-                    # NON dipende dalle parole del modello: il bridge lo manda il main con il testo fisso di Jack,
-                    # il testo del modello in questo turno viene scartato (cosi' non puo' dire "ti registro io").
-                    _rt_l = reply_text.lower()
-                    # In E1 ogni ESCALATION di Agent 1/2 su una chat non ancora in registrazione e' l'innesco,
-                    # tranne: richiesta di chiamata/vocale, frasi di attesa "verifico", lead perso dopo i 2 tentativi.
-                    _innesco = (reply_text.startswith("[PAUSE]") and e1_attivo(sender_id)
-                                and reg_get(sender_id).get("stato") not in STATI_REG
-                                and (re.search(r'\blink\b|registr', _rt_l)
-                                     or not re.search(r'chiamata|videochiamata|vocale|verific|manager|ufficio|domattina|nessun problema|se in futuro|buona giornata|scrivimi', _rt_l)))
-                    if _innesco:
+                    # INNESCO = flag esplicito [PRONTO] dell'Agent 1/2 (checklist nel prompt: sistema spiegato, capitale detto,
+                    # nessuna domanda/obiezione/rinvio nell'ultimo messaggio del lead). Il ponte lo manda il main con il testo
+                    # fisso di Jack; il modello puo' aggiungere al massimo una frase di conferma del capitale.
+                    # [ESCALATION] NON innesca piu' nulla: e' solo "chiudi tu" (pausa + alert), anche con E1 attivo.
+                    if re.search(r'\[\s*PRONTO\s*\]', reply_text, re.I) and reg_get(sender_id).get("stato") not in STATI_REG:
+                        testo_conferma = reply_text[7:] if reply_text.startswith("[PAUSE]") else reply_text
+                        testo_conferma = _RE_FLAG_GLOBAL.sub('', testo_conferma)
+                        testo_conferma = re.sub(r'\[\s*[A-Z0-9_]{2,30}\s*\]', '', testo_conferma).strip()
+                        if _RE_TESTO_PRONTO_VIETATO.search(testo_conferma) or len(testo_conferma) > 220:
+                            print(f"[PRONTO] testo del modello scartato (faceva lui il ponte): {testo_conferma[:80]}")
+                            testo_conferma = ""
                         scelta = "copy" if re.search(r'\bcopy\b', chat_history or "", re.I) and not re.search(r'manual', (combined_text or ""), re.I) else reg_get(sender_id).get("scelta") or ""
-                        # Solo la domanda. Il link parte quando risponde (Agent 3) o dopo 2h di silenzio (follow-up).
-                        await send_split_messages(sender_id, "Ti giro subito il link per registrarti su AXI e partire. Hai 10 minuti adesso? Ti seguo io passo passo 💪")
-                        reg_set(sender_id, stato="attesa_link", scelta=scelta, orario_dichiarato="", tocchi=0)
-                        asyncio.create_task(notify_jack(
-                            f"🔗 INNESCO E1\n\n👤 {sender_info['full_name']}\n\nCapitale concordato, chiesto se ha 10 minuti. Il link parte alla sua risposta (o dopo 2h). Tu entri a deposito fatto.\n👉 {link_chat(sender_info, sender_id)}",
-                            topic="alert"))
+                        if testo_conferma:
+                            await send_split_messages(sender_id, testo_conferma)
+                            await asyncio.sleep(random.uniform(2.0, 4.0))
+                        await send_split_messages(sender_id, BRIDGE_INNESCO)
+                        annulla_fu_rapido(sender_id)
+                        _l = link_chat(sender_info, sender_id)
+                        if e1_attivo(sender_id):
+                            reg_set(sender_id, stato="attesa_link", scelta=scelta, orario_dichiarato="", tocchi=0, rapido_ts="")
+                            asyncio.create_task(notify_jack(
+                                f"🔗 INNESCO E1\n\n👤 {sender_info['full_name']}\n\nObiezioni chiuse e capitale concordato: gli ho chiesto se ha altre domande o 10 minuti. "
+                                f"Il link parte SOLO quando risponde di si' (mai in automatico). Se non risponde: 3 follow-up (2h, mattina dopo, +2 giorni), poi ti avviso.\n👉 {_l}",
+                                topic="alert"))
+                        else:
+                            paused_leads.add(sender_id); _salva_paused_leads()
+                            asyncio.create_task(notify_jack(
+                                f"🟢 LEAD PRONTO - CHIUDI TU (E1 non attivo)\n\n👤 {sender_info['full_name']}\n\nObiezioni chiuse e capitale concordato. Gli ho scritto: "
+                                f"\"{BRIDGE_INNESCO}\"\nManda tu link e tutorial e seguilo (oppure /e1 {sender_id} e Riprendi agent per farlo seguire dall'agent).\n"
+                                f"⏸ Agent in pausa su questa chat.\n👉 {_l}",
+                                topic="alert", buttons=[[{"text": "▶️ Riprendi agent", "callback_data": f"resume:{sender_id}"}]]))
+                        print(f"[PRONTO] innesco per {sender_info['full_name']} (E1={'si' if e1_attivo(sender_id) else 'no'})")
                         return
 
                     # UN SOLO FLAG: se il modello ne ha scritti due (es. ALERT_CHIUSURA + ESCALATION),
@@ -773,7 +793,10 @@ async def process_messages(sender_id, sender_info, debounce):
 
                     # Gestione PAUSE — escalation
                     if reply_text.startswith("[PAUSE]"):
-                        clean_reply = reply_text[7:].strip()
+                        # nessun flag deve finire al lead nemmeno qui (es. [AUDIO_2] scritto insieme a [ESCALATION])
+                        clean_reply = _RE_FLAG_GLOBAL.sub('', reply_text[7:])
+                        clean_reply = re.sub(r'\[\s*[A-Z0-9_]{2,30}\s*\]', '', clean_reply)
+                        clean_reply = re.sub(r'\n{3,}', '\n\n', clean_reply).strip()
                         # Se è notte sostituisci con messaggio notturno
                         if is_night_time():
                             clean_reply = get_night_bridge_message(
@@ -818,6 +841,17 @@ async def process_messages(sender_id, sender_info, debounce):
                             doc_da_inviare.append(k)
                     clean_reply = re.sub(r'\[\s*DOC\s*:\s*[a-z_]+\s*\]', '', clean_reply, flags=re.I).strip()
                     clean_reply = re.sub(r'\[\s*ORARIO\s*:[^\]]*\]', '', clean_reply, flags=re.I).strip()
+                    # RINVIO dichiarato dal lead ("in settimana", "a settembre", "quando arriva lo stipendio"): niente link, niente pausa.
+                    # Lo segno e avviso Jack; i follow-up normali gia' aspettano la data promessa (controllo data in n8n).
+                    m_rv = re.search(r'\[\s*RINVIO\s*:\s*([^\]]{2,60})\]', clean_reply, re.I)
+                    clean_reply = re.sub(r'\[\s*RINVIO\s*:[^\]]*\]', '', clean_reply, flags=re.I).strip()
+                    clean_reply = re.sub(r'\[\s*PRONTO\s*\]', '', clean_reply, flags=re.I).strip()
+                    if m_rv:
+                        lead_state.setdefault("rinvii", {})[str(sender_id)] = {"quando": m_rv.group(1).strip(), "ts": datetime.now(pytz.UTC).isoformat()}
+                        _salva_lead_state()
+                        asyncio.create_task(notify_jack(
+                            f"📅 RINVIO\n\n👤 {sender_info['full_name']}\n\nHa rimandato: \"{m_rv.group(1).strip()}\". Niente link, l'agent riprende quando riscrive; i follow-up aspettano la data.\n👉 {_link}",
+                            topic="alert"))
                     if not e1_attivo(sender_id):
                         doc_da_inviare = []
                     if "link_registrazione" in doc_da_inviare and reg_get(sender_id).get("stato") == "whitelist":
@@ -919,6 +953,8 @@ async def process_messages(sender_id, sender_info, debounce):
                         'AUDIO_1': re.compile(r'\[\s*AUDIO[_\s]*1\s*\]', re.I),
                         'AUDIO_2': re.compile(r'\[\s*AUDIO[_\s]*2\s*\]', re.I),
                         'AUDIO_3': re.compile(r'\[\s*AUDIO[_\s]*3\s*\]', re.I),
+                        'PRONTO': re.compile(r'\[\s*PRONTO\s*\]', re.I),
+                        'RINVIO': re.compile(r'\[\s*RINVIO\s*:[^\]]*\]', re.I),
                     }
                     flag_trovati = [nome for nome, pat in FLAG_PATTERNS.items() if pat.search(clean_reply)]
                     if flag_trovati:
@@ -1432,10 +1468,22 @@ ULTIMI MESSAGGI DELLA CHAT:
 Rispondi SOLO con il testo del messaggio (o SKIP). Niente virgolette, niente spiegazioni."""
 
 
+# Follow-up di vendita FISSI (v34): con i testi personalizzati la conversione e' calata. Questi tre sono quelli di Jack
+# e devono restare IDENTICI a FU_SEND nel nodo n8n "Decidi Azione Follow-Up". FU_PERSONALIZZATI=true riattiva la generazione.
+FU_FISSI = {
+    1: "Fammi sapere se hai domande, sarei felice di averti in community 😊",
+    2: "Nel gruppo continuiamo a condividere le operazioni ogni giorno, ci stai dando un'occhiata?",
+    3: "Ti faccio una domanda secca: c'è qualcosa che non ti ha convinto? Dimmelo pure com'è, se posso chiarirtelo lo faccio volentieri.",
+}
+FU_PERSONALIZZATI = os.environ.get("FU_PERSONALIZZATI", "").lower() in ("1", "true", "yes")
+
+
 async def genera_followup(chat_id: int, n: int, caldo: bool, ore: float) -> str:
-    """Genera il testo del follow-up dallo storico reale della chat. Ritorna "" se non va inviato."""
+    """Testo del follow-up n (1..3). Di default i tre testi fissi di Jack; generato dallo storico solo con FU_PERSONALIZZATI=true."""
+    if not FU_PERSONALIZZATI:
+        return FU_FISSI.get(int(n) or 1, FU_FISSI[1])
     if not ANTHROPIC_API_KEY:
-        return ""
+        return FU_FISSI.get(int(n) or 1, FU_FISSI[1])
     _, msgs = await read_chat_messages(chat_id, hours=720, limit=40)
     if not msgs:
         return ""
@@ -1934,11 +1982,31 @@ Rispondi SOLO con il testo del messaggio (o SKIP), senza virgolette."""
 
 # Ore dall'ultimo NOSTRO messaggio per i solleciti orari (tocco 1..4), dopo il sollecito rapido dei 10-15 minuti
 # che parte dal main (programma_fu_rapido). Ritmo di Jack: 10-15 min -> 2h -> 6h -> giorno dopo -> 48h -> a Jack, mai Perso.
-# attesa_link: dopo 2h senza risposta a "hai 10 minuti?" il link parte lo stesso.
+# attesa_link (v34): il link NON parte mai senza una risposta del lead. Tre follow-up fissi: 2h (soft), poi la mattina
+# dopo (FOMO: si sta operando, ti tengo il posto), poi dopo altri 2 giorni ("peccato perdere l'opportunita'"), poi alert a Jack.
 SOGLIE_FU_REG = {
-    "attesa_link": [2], "link_inviato": [2, 6, 24, 48], "in_registrazione": [2, 6, 24, 48], "registrato": [2, 8, 24, 48],
+    "attesa_link": [2, 14, 62], "link_inviato": [2, 6, 24, 48], "in_registrazione": [2, 6, 24, 48], "registrato": [2, 8, 24, 48],
 }
-SOGLIA_ATTESA_LINK_CON_ORARIO = 20   # "lo faccio stasera" e poi sparisce: dopo 20h il link parte lo stesso
+SOGLIA_ATTESA_LINK_CON_ORARIO = 20   # "lo faccio stasera" e poi sparisce: si aspetta 20h, poi partono i follow-up (non il link)
+FU_ATTESA_LINK = [
+    "Ci sei? Quando hai 10 minuti ti giro il link e la facciamo assieme, ti seguo io passo passo",
+    "{saluto} {operativita}, ti aspettavo dentro. Ti tengo il posto: quando hai 10 minuti mi scrivi e partiamo 💪",
+    "Sarebbe un peccato perdere l'opportunità, stiamo facendo un mese di fuoco. Quando vuoi partire io sono qui e ti seguo nella registrazione 🤝",
+]
+
+
+def testo_fu_attesa_link(n: int, now_it=None) -> str:
+    """Testo del follow-up n (1..3) per chi non ha risposto a 'hai 10 minuti?'. Il secondo si adatta a ora e giorno."""
+    now_it = now_it or datetime.now(ITALY_TZ)
+    t = FU_ATTESA_LINK[max(0, min(n - 1, len(FU_ATTESA_LINK) - 1))]
+    saluto = "Buongiorno!" if now_it.hour < 13 else "Ciao!"
+    if now_it.weekday() >= 5:
+        operativita = "Lunedì il team riparte a operare"
+    elif now_it.hour < 13:
+        operativita = "Il team è già operativo da stamattina"
+    else:
+        operativita = "Il team ha già operato oggi"
+    return t.format(saluto=saluto, operativita=operativita)
 STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
 FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido
 FU_RAPIDO_PAUSA_ORE = 3                             # non piu' di un sollecito rapido ogni 3 ore per chat
@@ -2026,7 +2094,8 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         soglie = SOGLIE_FU_REG[stato]
         if tocchi >= len(soglie):
             continue
-        if tocchi >= 2 and not finestra_piena:
+        # dal tocco 3 solo nelle finestre 9-10 / 18-19; per attesa_link gia' dal tocco 2 (deve arrivare "la mattina dopo", non alle 3 di notte)
+        if tocchi >= (1 if stato == "attesa_link" else 2) and not finestra_piena:
             report["skip"][cid] = "fuori finestra"; continue
         if pending_messages.get(int(cid)):
             continue   # sta scrivendo adesso
@@ -2039,29 +2108,26 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         ore = _ore_da(msgs[-1]["timestamp_iso"]) or 0
         soglia = soglie[tocchi]
         if stato == "attesa_link" and r.get("orario_dichiarato"):
-            soglia = SOGLIA_ATTESA_LINK_CON_ORARIO   # ha detto quando: si aspetta, ma non all'infinito
+            soglia = max(soglia, SOGLIA_ATTESA_LINK_CON_ORARIO)   # ha detto quando: si aspetta, ma non all'infinito
         if ore < soglia:
             continue
         if dry_run:
             report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "dry_run": True}); continue
         if stato == "attesa_link":
-            # non ha risposto a "hai 10 minuti?" (o aveva detto "stasera" ed e' sparito): il link parte lo stesso, senza pressione
-            nome = ""
-            try:
-                ent = await _get_entity_robusto(int(cid)); nome = getattr(ent, 'first_name', '') or ''
-            except Exception:
-                pass
-            await send_split_messages(int(cid), "Intanto ti lascio qui il link, così quando hai 10 minuti lo fai e mi scrivi")
-            ok1 = await invia_template(int(cid), "link_registrazione", nome)
-            ok2 = await invia_template(int(cid), "tutorial_registrazione", nome)
-            if ok1:
-                reg_set(cid, stato="link_inviato", tocchi=0, rapido_ts="")
+            # non ha risposto a "hai altre domande o 10 minuti?": MAI il link da solo (a chi non ha detto si' resta li' e lo brucia).
+            # Testi fissi di Jack: soft, poi FOMO la mattina dopo, poi "peccato perdere l'opportunita'". Poi Jack decide.
+            testo = testo_fu_attesa_link(tocchi + 1, now_it)
+            await send_split_messages(int(cid), testo)
+            reg_set(cid, tocchi=tocchi + 1)
+            report["inviati"].append({"chat_id": cid, "stato": stato, "tocco": tocchi + 1, "testo": testo})
+            if tocchi + 1 >= len(soglie):
                 try:
-                    await notify_jack(f"🔗 LINK INVIATO (E1, dopo 2h di silenzio)\n\n👤 {nome or cid}\n\nNon aveva risposto a 'hai 10 minuti?': "
-                                      f"link{' e tutorial' if ok2 else ' (tutorial NON partito: mandalo tu)'} inviati lo stesso.\n👉 tg://user?id={cid}", topic="alert")
+                    await notify_jack(f"⏳ NON RISPONDE (E1)\n\nChat {cid}: 3 follow-up dopo 'hai 10 minuti?' senza risposta. Il link NON e' partito. "
+                                      f"Non lo mando in Perso: decidi tu (scrivigli o lascialo ai follow-up normali).\n👉 tg://user?id={cid}", topic="alert")
+                    report["alert"].append(cid)
                 except Exception:
                     pass
-            report["inviati"].append({"chat_id": cid, "stato": "attesa_link->link_inviato", "tocco": 1}); continue
+            continue
         n_sollecito = tocchi + 1 + (1 if r.get("rapido_ts") else 0)
         try:
             testo = await _genera_testo_fu_reg(int(cid), stato, min(n_sollecito, 5), f"{int(ore)} ore", msgs)
@@ -2112,7 +2178,7 @@ async def handle_e1_ids(request: web.Request) -> web.Response:
     elif request.path.endswith("e1-remove") and cid.isdigit():
         lead_state["e1_ids"] = [x for x in ids if x != int(cid)]; lead_state.get("reg", {}).pop(cid, None); _salva_lead_state()
     return web.json_response({"ok": True, "e1_all": E1_ALL, "env_ids": sorted(E1_TEST_IDS), "extra_ids": sorted(e1_ids_extra()),
-                              "reg": lead_state.get("reg", {})})
+                              "reg": lead_state.get("reg", {}), "rinvii": lead_state.get("rinvii", {})})
 
 
 async def handle_reload_templates(request: web.Request) -> web.Response:
