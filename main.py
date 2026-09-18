@@ -42,6 +42,22 @@ pending_messages = {}
 import random
 
 
+# "Ok" scritto mentre gli sta arrivando un vocale: non e' una risposta, e' un "ricevuto". Se rispondessimo subito
+# parleremmo sopra all'audio. Si aspetta che risponda davvero al vocale; se non scrive altro, dopo l'attesa si procede.
+ATTESA_ACK_AUDIO = 40             # secondi di attesa dopo un "ok" arrivato durante/subito dopo un vocale
+FINESTRA_ACK_AUDIO = 180          # entro quanti secondi dall'invio del vocale un "ok" conta come "ricevuto"
+_RE_ACK_BREVE = re.compile(r"^\W*(ok+|okay|okey|oki|va bene|vabene|vabb[eè]|perfetto|top|grazie|ok grazie|s[iì]|certo|ascolto|sentiamo|dimmi|aspetto|👍|👌|🙏|✅)\W*$", re.I)
+audio_in_invio = set()            # chat a cui stiamo mandando un vocale in questo momento
+ultimo_audio_ts = {}              # chat_id -> time.time() dell'ultimo vocale inviato
+
+
+def e_ack_durante_audio(chat_id, testo: str) -> bool:
+    t = (testo or "").strip()
+    if len(t) > 25 or not _RE_ACK_BREVE.match(t):
+        return False
+    return chat_id in audio_in_invio or (time.time() - ultimo_audio_ts.get(chat_id, 0)) < FINESTRA_ACK_AUDIO
+
+
 def debounce_dinamico(testo_totale: str) -> int:
     """
     Attesa prima di rispondere, in base a quanto ha scritto il lead (tutti i messaggi accumulati).
@@ -935,6 +951,8 @@ async def process_messages(sender_id, sender_info, debounce):
                         # Rimuove SEMPRE il marker dal testo visibile, anche se non e' il primo,
                         # cosi' non resta mai scritto un flag letterale tipo "[AUDIO_2]" nel messaggio
                         clean_reply = clean_reply.replace(marker, "").strip()
+                    if audio_key_to_send:
+                        audio_in_invio.add(sender_id)   # da qui in poi un "ok" del lead e' un "ricevuto", non una risposta
 
                     # RETE DI SICUREZZA: se un flag e' sopravvissuto alla pulizia di n8n
                     # (streaming che lo spezza, o il modello che scrive una variante tipo
@@ -1047,6 +1065,9 @@ async def process_messages(sender_id, sender_info, debounce):
                                     os.remove(tmp_path)
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
+                        finally:
+                            audio_in_invio.discard(sender_id)
+                            ultimo_audio_ts[sender_id] = time.time()
 
                     # E1: se dopo la nostra risposta resta fermo 10-15 minuti, lo risentiamo (come fa Jack)
                     programma_fu_rapido(sender_id, sender_info)
@@ -1247,6 +1268,9 @@ async def handle_incoming(event):
             # tutti i messaggi accumulati finora: piu' scrive, piu' aspettiamo (entro i limiti)
             testo_totale = " ".join(m["text"] for m in pending_messages[sender_id] if m.get("media_type") == "text")
             debounce = debounce_dinamico(testo_totale)
+            if e_ack_durante_audio(sender_id, testo_totale):
+                debounce = ATTESA_ACK_AUDIO   # "ok" al vocale: aspetto la risposta vera, non parlo sopra all'audio
+                print(f"[DEBOUNCE] {full_name}: 'ok' durante il vocale, aspetto {debounce}s la risposta vera")
         sender_info = {
             "full_name": full_name,
             "username": sender_username,
