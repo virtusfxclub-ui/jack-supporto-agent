@@ -14,6 +14,7 @@ from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
+N8N_RETRY_ATTESA = int(os.environ.get("N8N_RETRY_ATTESA", "8"))   # secondi prima di riprovare se n8n va in errore
 CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-1003808377504"))
 # Topic del gruppo di controllo: il flusso normale va in "chat", le cose che
 # richiedono un'azione di Jack vanno in "alert" (che lui tiene con le notifiche accese).
@@ -182,7 +183,7 @@ def _carica_lead_state() -> dict:
         with open(LEAD_STATE_FILE, "r") as fh:
             d = json.load(fh)
             if not isinstance(d, dict): d = {}
-            for k in ("rientri", "cache", "fu", "reg", "rinvii", "agent_msgs", "audio_ids", "appuntamenti"): d.setdefault(k, {})
+            for k in ("rientri", "cache", "fu", "reg", "rinvii", "agent_msgs", "audio_ids", "appuntamenti", "screens"): d.setdefault(k, {})
             return d
     except Exception:
         return {"rientri": {}, "cache": {}, "fu": {}, "reg": {}}
@@ -225,6 +226,40 @@ def ricorda_audio(chat_id, msg_id, audio_key: str):
         _salva_lead_state()
     except Exception as e:
         print(f"[STATE] audio_ids non salvato: {e}")
+
+
+def ricorda_screen(chat_id, msg_id, desc: str):
+    """Descrizione di uno screenshot del lead, per msg_id. Serve allo storico: senza, il messaggio con foto
+    compare come sola didascalia ("Vedo questo") e al turno dopo l'agent risponde "non vedo l'immagine"."""
+    d = lead_state.setdefault("screens", {}).setdefault(str(chat_id), {})
+    d[str(msg_id)] = (desc or "")[:300]
+    if len(d) > 20:
+        for k in sorted(d, key=lambda x: int(x))[:-20]:
+            d.pop(k, None)
+    try:
+        _salva_lead_state()
+    except Exception as e:
+        print(f"[STATE] screens non salvato: {e}")
+
+
+def desc_screen(chat_id, msg_id) -> str:
+    return (lead_state.get("screens") or {}).get(str(chat_id), {}).get(str(msg_id), "")
+
+
+# Screenshot che mostra un deposito riuscito: alert a Jack dal main, senza aspettare che l'agent scriva [ALERT_DEPOSITO].
+_RE_SCREEN_DEP_PAROLA = re.compile(r'deposit|versament|finanziament|pagament|ricevuta|transazion|accredit', re.I)
+_RE_SCREEN_DEP_OK = re.compile(r'success|riuscit|completat|accreditat|approvat|confermat|buon fine', re.I)
+
+
+def screen_deposito_riuscito(desc: str) -> bool:
+    """caso 10 = sempre. caso 4/6 = solo se parla di deposito/pagamento E di esito positivo
+    ("conto creato con successo" non basta: non e' un deposito)."""
+    d = (desc or "").lower()
+    if re.match(r'\s*caso\s*10\b', d):
+        return True
+    if re.match(r'\s*caso\s*(4|6)\b', d) and _RE_SCREEN_DEP_PAROLA.search(d) and _RE_SCREEN_DEP_OK.search(d):
+        return True
+    return False
 
 
 def _ripristina_memoria_agent():
@@ -700,7 +735,7 @@ async def send_split_messages(chat_id, text):
         if i < len(parts) - 1:
             # pausa "di lettura" tra un messaggio e l'altro (il typing del prossimo si aggiunge)
             await asyncio.sleep(random.uniform(1.5, 4.0))
-async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool = False):
+async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool = False, _tentativo: int = 0):
     await asyncio.sleep(debounce)
     # Se il lead sta ancora scrivendo, aspetto che smetta (max TYPING_MAX_EXTRA): cosi' rispondo a tutto in una volta
     # invece di dare due risposte separate a un messaggio spezzato in due.
@@ -767,6 +802,7 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
         "media_type": media_type,
         "telegram_history": chat_history
     }
+    _risposta_ricevuta = False
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -775,6 +811,7 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                 timeout=aiohttp.ClientTimeout(total=180)
             ) as resp:
                 if resp.status == 200:
+                    _risposta_ricevuta = True
                     _grezzo = ""
                     try:
                         reply_text = await resp.text()
@@ -988,13 +1025,17 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                             reg_set(sender_id, stato="deposito_dichiarato"); paused_leads.add(sender_id); _salva_paused_leads()
                             if "benvenuto" not in reg_get(sender_id).get("docs", []):
                                 doc_da_inviare.append("benvenuto")   # unico caso in cui l'agent manda il link VIP
-                        asyncio.create_task(notify_jack(
-                            f"🟢 DEPOSITO FATTO\n\n"
-                            f"👤 {sender_info['full_name']}\n\n"
-                            f"Dice di aver depositato: verifica e dagli l'accesso al VIP.\n\n"
-                            f"👉 Apri la chat: {_link}",
-                            topic="alert"
-                        ))
+                        _scr_ore = _ore_da(reg_get(sender_id).get("deposito_screen_ts") or "")
+                        if _scr_ore is not None and _scr_ore < 1:
+                            print(f"[ALERT_DEPOSITO] {sender_id}: alert gia' mandato dallo screenshot, non lo ripeto")
+                        else:
+                            asyncio.create_task(notify_jack(
+                                f"🟢 DEPOSITO FATTO\n\n"
+                                f"👤 {sender_info['full_name']}\n\n"
+                                f"Dice di aver depositato: verifica e dagli l'accesso al VIP.\n\n"
+                                f"👉 Apri la chat: {_link}",
+                                topic="alert"
+                            ))
 
                     # Gestione AUDIO — Claude decide nel testo quale audio mandare, se serve
                     AUDIO_KEY_MAP = {
@@ -1138,6 +1179,26 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                     print(f"[ERROR] n8n status: {resp.status}")
     except Exception as e:
         print(f"[EXCEPTION] {e}")
+    if not _risposta_ricevuta:
+        await _agent_fallito(sender_id, sender_info, messages, combined_text, _rientro_a3, _tentativo)
+
+
+async def _agent_fallito(sender_id, sender_info, messages, combined_text, _rientro_a3, _tentativo):
+    """n8n ha risposto con errore o non ha risposto: al primo giro si riprova dopo pochi secondi (era un errore di
+    encoding sullo screenshot del deposito del 18/09: il lead e' rimasto senza risposta), al secondo Jack viene avvisato."""
+    if _tentativo == 0:
+        print(f"[RETRY] n8n fallito per {sender_id}: riprovo tra {N8N_RETRY_ATTESA}s")
+        pending_messages[sender_id] = list(messages) + list(pending_messages.get(sender_id, []))
+        t = asyncio.create_task(process_messages(sender_id, sender_info, N8N_RETRY_ATTESA, _rientro_a3=_rientro_a3, _tentativo=1))
+        pending_tasks[sender_id] = t
+        return
+    try:
+        await notify_jack(
+            f"⚠️ AGENT NON HA RISPOSTO (errore tecnico, 2 tentativi)\n\n👤 {sender_info['full_name']}\n"
+            f"💬 {(combined_text or '[media]')[:300]}\n\nIl lead non ha ricevuto risposta: rispondi tu.\n👉 {link_chat(sender_info, sender_id)}",
+            topic="alert")
+    except Exception as e:
+        print(f"[NOTIFY ERROR] agent fallito {sender_id}: {e}")
 @client.on(events.UserUpdate)
 async def on_user_typing(event):
     """Traccia lo stato 'sta scrivendo' dei lead (chat private) per il debounce."""
@@ -1226,7 +1287,27 @@ async def handle_incoming(event):
                 # E1: lo screenshot viene descritto e passato all'agent come testo. L'agent risponde solo ai casi noti.
                 desc = await descrivi_screenshot(sender_id, event.message)
                 if not desc:
+                    await asyncio.sleep(3)
+                    desc = await descrivi_screenshot(sender_id, event.message)   # secondo tentativo: un timeout non deve costare la chiusura
+                if not desc:
                     desc = "caso 9: screenshot non leggibile"
+                    _link = link_chat({"username": sender_username}, sender_id)
+                    asyncio.create_task(notify_jack(
+                        f"🖼 SCREENSHOT NON LETTO (errore tecnico)\n\n👤 {full_name}\n"
+                        f"Non sono riuscito a leggere lo screen: l'agent gli chiede di rimandarlo. Se serve, guardalo tu.\n👉 {_link}",
+                        topic="alert"))
+                try:
+                    ricorda_screen(sender_id, event.message.id, desc)
+                except Exception:
+                    pass
+                if screen_deposito_riuscito(desc) and not reg_get(sender_id).get("deposito_screen_ts"):
+                    # deposito visibile nello screen: Jack lo sa subito, anche se poi l'agent sbaglia il flag
+                    reg_set(sender_id, deposito_screen_ts=datetime.now(pytz.UTC).isoformat())
+                    _link = link_chat({"username": sender_username}, sender_id)
+                    asyncio.create_task(notify_jack(
+                        f"🟢 DEPOSITO FATTO (dallo screenshot)\n\n👤 {full_name}\n"
+                        f"Screen: {desc[:200]}\n\nVerifica e dagli l'accesso al VIP.\n👉 {_link}",
+                        topic="alert"))
                 message_text = f"[SCREENSHOT: {desc}]" + (f" Didascalia: {message_text}" if message_text else "")
                 media_type = "screenshot"   # debounce corto: chi manda uno screen aspetta una risposta, non un minuto
                 if reg_get(sender_id).get("stato") == "link_inviato":
@@ -2105,7 +2186,8 @@ def testo_fu_attesa_link(n: int, now_it=None) -> str:
         operativita = "Il team ha già operato oggi"
     return t.format(saluto=saluto, operativita=operativita)
 STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
-FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido
+FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido (registrato: sta scegliendo il metodo di deposito)
+FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX = 20 * 60, 30 * 60   # link_inviato/in_registrazione: la registrazione dura 10-20 minuti, a 13 minuti "Ci sei?" e' invadente
 FU_RAPIDO_PAUSA_ORE = 3                             # non piu' di un sollecito rapido ogni 3 ore per chat
 fu_rapido_tasks = {}
 
@@ -2352,11 +2434,15 @@ def programma_fu_rapido(chat_id, sender_info: dict):
 
 async def _fu_rapido(chat_id, sender_info: dict):
     try:
-        attesa = random.randint(FU_RAPIDO_MIN, FU_RAPIDO_MAX)
+        _st0 = reg_get(chat_id).get("stato")
+        _min, _max = (FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX) if _st0 in ("link_inviato", "in_registrazione") else (FU_RAPIDO_MIN, FU_RAPIDO_MAX)
+        attesa = random.randint(_min, _max)
         await asyncio.sleep(attesa)
         r = reg_get(chat_id); stato = r.get("stato")
         if stato not in STATI_FU_RAPIDO or chat_id in paused_leads or is_night_time():
             return
+        if str(chat_id) in lead_state.get("appuntamenti", {}):
+            return   # ha detto quando lo fa: lo risentiamo noi all'ora giusta, non prima
         if pending_messages.get(chat_id) or (time.time() - last_typing.get(chat_id, 0)) < 90:
             return   # sta scrivendo adesso: risponde l'agent
         if r.get("orario_dichiarato"):
@@ -2368,7 +2454,7 @@ async def _fu_rapido(chat_id, sender_info: dict):
         if not msgs or not _is_our_sender(msgs[-1]["sender"]):
             return
         silenzio = _ore_da(msgs[-1]["timestamp_iso"]) or 0
-        if silenzio * 60 < FU_RAPIDO_MIN / 60 - 1:
+        if silenzio * 60 < _min / 60 - 1:
             return
         testo = await _genera_testo_fu_reg(int(chat_id), stato, 1, f"{int(silenzio * 60)} minuti", msgs)
         if not testo:
@@ -2512,9 +2598,15 @@ async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
             if msg.out:
                 _raw = (msg.message or "").strip()
                 sender = "Agent" if (msg.text.strip() in chat_agent_msgs or _raw in chat_agent_msgs) else "Jack (manuale)"
+                testo = msg.text
             else:
                 sender = getattr(entity, 'first_name', None) or "Lead"
-            messages.append({"sender": sender, "text": msg.text, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
+                testo = msg.text
+                if isinstance(msg.media, MessageMediaPhoto):
+                    # foto con didascalia: senza l'etichetta l'agent legge solo "Vedo questo" e chiede di rimandarla
+                    _d = desc_screen(chat_id, msg.id)
+                    testo = (f"[SCREENSHOT: {_d}] " if _d else "[screenshot inviato] ") + msg.text
+            messages.append({"sender": sender, "text": testo, "time": msg.date.strftime("%H:%M"), "timestamp_iso": msg.date.isoformat()})
             continue
         # Vocali: senza testo, ma DEVONO comparire nello storico o l'agent li rimanda.
         if getattr(msg, 'voice', None) and msg.out:
@@ -2525,7 +2617,8 @@ async def read_chat_messages(chat_id: int, hours: int = 72, limit: int = 5):
         # Media del lead senza testo: l'agent deve vederli nello storico (quanti screen ha mandato, se ha mandato un vocale)
         if not msg.out and msg.media is not None:
             if isinstance(msg.media, MessageMediaPhoto):
-                etichetta = "[screenshot inviato]"
+                _d = desc_screen(chat_id, msg.id)
+                etichetta = f"[SCREENSHOT: {_d}]" if _d else "[screenshot inviato]"
             elif getattr(msg, 'voice', None):
                 etichetta = "[vocale inviato]"
             else:
@@ -2919,19 +3012,18 @@ async def handle_reconcile_folders(request: web.Request) -> web.Response:
         notify = _flag("notify", False)
         max_claude = int(body.get("max_claude", q.get("max_claude", 40)))
         report = await reconcile_folders(dry_run=dry_run, max_claude=max_claude)
-        if notify and (report["movimenti"] or report["anomalie"]):
-            righe = [f"📁 Cartelle{' (DRY RUN)' if dry_run else ''}: {len(report['movimenti'])} spostamenti, {len(report['anomalie'])} da sistemare"]
-            if report["movimenti"]:
-                righe.append("")
-                for m in report["movimenti"][:15]:
+        if notify:
+            # Un solo messaggio al giorno (trigger n8n alle 21:00), solo gli spostamenti fatti. Le anomalie restano nel JSON
+            # dell'endpoint per chi le vuole vedere, ma non finiscono piu' nel gruppo alert.
+            n = len(report["movimenti"])
+            if n == 0:
+                righe = [f"📁 Cartelle oggi{' (DRY RUN)' if dry_run else ''}: nessuno spostamento"]
+            else:
+                righe = [f"📁 Cartelle oggi{' (DRY RUN)' if dry_run else ''}: {n} spostament{'o' if n == 1 else 'i'}", ""]
+                for m in report["movimenti"][:25]:
                     righe.append(f"• {m['nome']} — {', '.join(m['da']) or 'nessuna'} → {m['a']} ({m['motivo']})\n  {m['link']}")
-                if len(report["movimenti"]) > 15:
-                    righe.append(f"  … e altri {len(report['movimenti']) - 15}")
-            anomalie = sorted(report["anomalie"], key=lambda a: 0 if "PAUSA" in a["nota"] else 1)
-            if anomalie:
-                righe.append("\n🔧 DA SISTEMARE (spariscono al giro dopo):")
-                for a in anomalie[:20]:
-                    righe.append(f"⚠️ {a['nome']}: {a['nota']}\n  {a['link']}")
+                if n > 25:
+                    righe.append(f"  … e altri {n - 25}")
             await notify_jack("\n".join(righe), topic="alert")
         return web.json_response({"ok": True, **report})
     except Exception as e:
