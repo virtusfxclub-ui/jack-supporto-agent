@@ -15,6 +15,10 @@ API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 N8N_RETRY_ATTESA = int(os.environ.get("N8N_RETRY_ATTESA", "8"))   # secondi prima di riprovare se n8n va in errore
+# Vocale del lead che non siamo riusciti a trascrivere: l'agent non dice mai "non mi e' arrivato" (sembra un bot rotto),
+# si scusa come farebbe Jack in giro senza auricolari e chiede due righe scritte.
+VOCALE_NON_LETTO = ("[Messaggio vocale che NON riesci ad ascoltare adesso. Scusati con naturalezza dicendo che ora "
+                    "non riesci ad ascoltarlo e chiedigli di scrivertelo in due righe. Non dire che non e' arrivato.]")
 CONTROL_CHAT_ID = int(os.environ.get("CONTROL_CHAT_ID", "-1003808377504"))
 # Topic del gruppo di controllo: il flusso normale va in "chat", le cose che
 # richiedono un'azione di Jack vanno in "alert" (che lui tiene con le notifiche accese).
@@ -696,8 +700,10 @@ def ricuci_testo(text: str) -> str:
     # Protegge i doppi a capo VERI (separatori di messaggio) con un segnaposto
     SEP = '\x00SEP\x00'
     t = re.sub(r'\n\s*\n+', SEP, t)
-    # A capo singolo tra due caratteri di parola (lettere, cifre, _, apostrofi) = parola spezzata -> ricuci senza spazio
-    t = re.sub(r"(?<=[\wàèéìòùÀÈÉÌÒÙ'’])\n(?=[\wàèéìòùÀÈÉÌÒÙ'’])", '', t)
+    # A capo singolo tra due MINUSCOLE/cifre = parola spezzata dallo streaming -> ricuci senza spazio.
+    # Se dopo l'a capo c'e' una MAIUSCOLA e' una frase nuova: diventa uno spazio piu' sotto, non si incolla
+    # ("nessuna fretta da parte mia\nSegui pure" -> "miaSegui pure", visto in chat il 20/09).
+    t = re.sub(r"(?<=[a-zàèéìòù0-9'’])\n(?=[a-zàèéìòù0-9'’])", '', t)
     # A capo davanti a punteggiatura di chiusura / dopo apertura -> via
     t = re.sub(r'\n(?=[,.;:!?)\]»”%€$])', '', t)
     t = re.sub(r'(?<=[(\[«“€$])\n', '', t)
@@ -1347,17 +1353,25 @@ async def handle_incoming(event):
                                 tmp_path = tmp.name
                             await client.download_media(event.message, file=tmp_path)
                             transcription = await transcribe_audio(tmp_path)
+                            if not transcription:
+                                await asyncio.sleep(2)
+                                transcription = await transcribe_audio(tmp_path)   # un buco di Whisper non deve costare il messaggio del lead
                             os.unlink(tmp_path)
                             if transcription:
                                 message_text = f"[MESSAGGIO VOCALE TRASCRITTO]: {transcription}"
                                 print(f"[AUDIO] Trascrizione: {transcription[:100]}")
                             else:
-                                message_text = "[Messaggio vocale non trascritto — chiedi di ripetere per iscritto]"
+                                message_text = VOCALE_NON_LETTO
+                                _link = link_chat({"username": sender_username}, sender_id)
+                                asyncio.create_task(notify_jack(
+                                    f"🎤 VOCALE NON TRASCRITTO\n\n👤 {full_name}\n"
+                                    f"Whisper non l'ha letto (2 tentativi): l'agent chiede di scriverlo. Ascoltalo tu se serve.\n👉 {_link}",
+                                    topic="alert"))
                         except Exception as e:
                             print(f"[AUDIO ERROR] {e}")
-                            message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
+                            message_text = VOCALE_NON_LETTO
                     else:
-                        message_text = "[Messaggio vocale — chiedi di ripetere per iscritto]"
+                        message_text = VOCALE_NON_LETTO
                 elif "video" in mime or mime == "video/mp4":
                     media_type = "video"
                     video_duration = 0
@@ -2187,6 +2201,7 @@ def testo_fu_attesa_link(n: int, now_it=None) -> str:
     return t.format(saluto=saluto, operativita=operativita)
 STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
 FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido (registrato: sta scegliendo il metodo di deposito)
+FU_RAPIDO_VAGO_MIN, FU_RAPIDO_VAGO_MAX = 45 * 60, 60 * 60   # ha detto un momento vago ("piu' tardi", "tra qualche minuto")
 FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX = 20 * 60, 30 * 60   # link_inviato/in_registrazione: la registrazione dura 10-20 minuti, a 13 minuti "Ci sei?" e' invadente
 FU_RAPIDO_PAUSA_ORE = 3                             # non piu' di un sollecito rapido ogni 3 ore per chat
 fu_rapido_tasks = {}
@@ -2434,8 +2449,13 @@ def programma_fu_rapido(chat_id, sender_info: dict):
 
 async def _fu_rapido(chat_id, sender_info: dict):
     try:
-        _st0 = reg_get(chat_id).get("stato")
-        _min, _max = (FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX) if _st0 in ("link_inviato", "in_registrazione") else (FU_RAPIDO_MIN, FU_RAPIDO_MAX)
+        _r00 = reg_get(chat_id); _st0 = _r00.get("stato")
+        if _r00.get("orario_dichiarato"):
+            _min, _max = FU_RAPIDO_VAGO_MIN, FU_RAPIDO_VAGO_MAX   # ha detto "piu' tardi": si aspetta di piu', ma si torna
+        elif _st0 in ("link_inviato", "in_registrazione"):
+            _min, _max = FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX
+        else:
+            _min, _max = FU_RAPIDO_MIN, FU_RAPIDO_MAX
         attesa = random.randint(_min, _max)
         await asyncio.sleep(attesa)
         r = reg_get(chat_id); stato = r.get("stato")
@@ -2445,8 +2465,8 @@ async def _fu_rapido(chat_id, sender_info: dict):
             return   # ha detto quando lo fa: lo risentiamo noi all'ora giusta, non prima
         if pending_messages.get(chat_id) or (time.time() - last_typing.get(chat_id, 0)) < 90:
             return   # sta scrivendo adesso: risponde l'agent
-        if r.get("orario_dichiarato"):
-            return   # ha detto quando lo fa: non si assilla
+        # Se aveva detto un orario PRECISO c'e' un appuntamento e siamo gia' usciti sopra (controllo appuntamenti).
+        # Qui l'orario e' vago ("piu' tardi", "tra qualche minuto"): si aspetta di piu' (FU_RAPIDO_VAGO) ma non si sparisce.
         ore_rapido = _ore_da(r.get("rapido_ts") or "")
         if ore_rapido is not None and ore_rapido < FU_RAPIDO_PAUSA_ORE:
             return
