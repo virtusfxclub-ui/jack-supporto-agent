@@ -2400,7 +2400,22 @@ async def _appuntamento(chat_id):
             return
         while is_night_time():
             await asyncio.sleep(300)
-        _, msgs = await read_chat_messages(int(chat_id), hours=24 * 3, limit=30)
+        try:
+            _, msgs = await read_chat_messages(int(chat_id), hours=24 * 3, limit=30)
+        except Exception as _e:
+            msgs = None
+            print(f"[APPUNTAMENTO] {chat_id}: chat non leggibile ({_e})")
+        if not msgs:
+            # chat cancellata dal lead, svuotata o non piu' raggiungibile: NON gli si scrive.
+            # Scrivere dentro una chat che il lead ha eliminato la fa riapparire: e' il modo piu' rapido
+            # per prendersi una segnalazione spam sull'account.
+            lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state()
+            _info0 = {"full_name": a.get("nome") or str(chat_id), "username": a.get("username") or "", "first_name": ""}
+            await notify_jack(
+                f"📅 APPUNTAMENTO SALTATO ({a.get('testo')})\n\n👤 {_info0['full_name']}\n\n"
+                f"La chat e' vuota o cancellata: non gli ho scritto nulla. Se serve scrivigli tu.\n👉 {link_chat(_info0, chat_id)}",
+                topic="alert")
+            return
         ts_app = datetime.fromisoformat(a["ts"])
         # se il lead ha scritto dopo aver fissato l'appuntamento, ci ha gia' pensato l'agent: niente messaggio
         if msgs and any((not _is_our_sender(m["sender"])) and datetime.fromisoformat(m["timestamp_iso"]) > ts_app for m in msgs):
@@ -3069,6 +3084,7 @@ async def start_http_server():
     app.router.add_get("/e1-list", handle_e1_ids)
     app.router.add_get("/registrazione-followup", handle_followup_registrazione)
     app.router.add_post("/registrazione-followup", handle_followup_registrazione)
+    app.router.add_get("/riepilogo",      handle_riepilogo)
     app.router.add_get("/reconcile-folders",  handle_reconcile_folders)
     app.router.add_post("/reconcile-folders", handle_reconcile_folders)
     runner = web.AppRunner(app)
@@ -3083,6 +3099,124 @@ async def start_http_server():
 # vuoto -> lo rimettiamo; punta altrove -> avvisiamo Jack (non lo sovrascriviamo: potrebbe servire a un altro flusso).
 TELEGRAM_CALLBACK_URL = os.environ.get("TELEGRAM_CALLBACK_URL", "https://giacomojack.app.n8n.cloud/webhook/telegram-callback")
 _webhook_avviso_inviato = ""
+
+
+# ---- Riepilogo giornaliero della pipeline (11:00 e 19:00) ----
+# Chi ha superato il pre-registrazione: ponte mandato, link mandato, sta compilando, registrato, deposito dichiarato,
+# piu' chi ha un appuntamento fissato. I lead ancora in trattativa (Agent 1) NON entrano: quelli sono rumore.
+RIEPILOGO_ORE = [int(x) for x in os.environ.get("RIEPILOGO_ORE", "11,19").replace(";", ",").split(",") if x.strip().isdigit()]
+_STATO_ETICHETTA = {
+    "attesa_link": "ponte mandato, aspetta il si' per il link",
+    "link_inviato": "link mandato, deve registrarsi",
+    "in_registrazione": "sta compilando la registrazione",
+    "registrato": "registrato, manca il deposito",
+    "deposito_dichiarato": "dice di aver depositato: da verificare",
+    "whitelist": "conto AXI vecchio, pratica whitelist",
+    "ripensamento": "ha frenato dopo il link",
+}
+_STATI_IN_REG = ("attesa_link", "link_inviato", "in_registrazione")
+_STATI_DA_CHIUDERE = ("registrato", "deposito_dichiarato", "whitelist", "ripensamento")
+
+
+async def _info_lead(chat_id, a=None):
+    """Nome, username e ore di silenzio per il riepilogo. Se la chat non si legge, si va avanti lo stesso."""
+    nome = (a or {}).get("nome") or ""
+    username = (a or {}).get("username") or ""
+    silenzio = None
+    try:
+        entity, msgs = await read_chat_messages(int(chat_id), hours=24 * 14, limit=3)
+        nome = (f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip()) or nome
+        username = getattr(entity, "username", "") or username
+        if msgs:
+            silenzio = _ore_da(msgs[-1]["timestamp_iso"])
+    except Exception as e:
+        print(f"[RIEPILOGO] {chat_id} non leggibile: {e}")
+    info = {"full_name": nome or str(chat_id), "username": username, "first_name": ""}
+    return info, silenzio
+
+
+def _da_quanto(ore):
+    if ore is None:
+        return ""
+    if ore < 1:
+        return f", fermo da {int(ore * 60)} min"
+    if ore < 24:
+        return f", fermo da {int(ore)}h"
+    return f", fermo da {int(ore // 24)}g"
+
+
+async def costruisci_riepilogo() -> str:
+    now_it = datetime.now(ITALY_TZ)
+    app = dict(lead_state.get("appuntamenti") or {})
+    reg = dict(lead_state.get("reg") or {})
+    righe_app, righe_reg, righe_chiudere = [], [], []
+    con_appuntamento = set()
+
+    for cid, a in sorted(app.items(), key=lambda kv: str(kv[1].get("quando", ""))):
+        try:
+            quando = datetime.fromisoformat(a["quando"])
+        except Exception:
+            continue
+        if quando < now_it - timedelta(minutes=30):
+            continue   # gia' passato: lo gestisce il timer, non e' roba da riepilogo
+        con_appuntamento.add(str(cid))
+        info, sil = await _info_lead(cid, a)
+        quando_txt = quando.strftime("%H:%M") if quando.date() == now_it.date() else quando.strftime("%d/%m %H:%M")
+        stato = (reg.get(str(cid)) or {}).get("stato") or ""
+        coda = f" — {_STATO_ETICHETTA.get(stato, stato)}" if stato else ""
+        pausa = " ⏸ in pausa" if int(cid) in paused_leads else ""
+        righe_app.append(f"• {quando_txt} — {info['full_name']} (\"{a.get('testo', '')}\"){coda}{pausa}\n  {link_chat(info, cid)}")
+
+    for cid, r in reg.items():
+        stato = (r or {}).get("stato") or ""
+        if stato not in _STATI_IN_REG + _STATI_DA_CHIUDERE or str(cid) in con_appuntamento:
+            continue
+        info, sil = await _info_lead(cid)
+        pausa = " ⏸ in pausa" if int(cid) in paused_leads else ""
+        riga = f"• {info['full_name']} — {_STATO_ETICHETTA.get(stato, stato)}{_da_quanto(sil)}{pausa}\n  {link_chat(info, cid)}"
+        (righe_reg if stato in _STATI_IN_REG else righe_chiudere).append(riga)
+
+    totale = len(righe_app) + len(righe_reg) + len(righe_chiudere)
+    if not totale:
+        return f"📋 RIEPILOGO {now_it.strftime('%H:%M')}\n\nNessuno in registrazione e nessun appuntamento in programma."
+    out = [f"📋 RIEPILOGO {now_it.strftime('%H:%M')} — {totale} in corso"]
+    if righe_app:
+        out.append("\n📅 APPUNTAMENTI\n" + "\n".join(righe_app))
+    if righe_reg:
+        out.append("\n🧭 IN REGISTRAZIONE\n" + "\n".join(righe_reg))
+    if righe_chiudere:
+        out.append("\n💰 DA CHIUDERE\n" + "\n".join(righe_chiudere))
+    return "\n".join(out)
+
+
+async def riepilogo_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            now = datetime.now(ITALY_TZ)
+            oggi = [ITALY_TZ.localize(datetime(now.year, now.month, now.day, h, 0)) for h in RIEPILOGO_ORE]
+            futuri = [t for t in oggi if t > now]
+            target = min(futuri) if futuri else min(oggi) + timedelta(days=1)
+            await asyncio.sleep(max(30, (target - now).total_seconds()))
+            await notify_jack(await costruisci_riepilogo(), topic="alert")
+            await asyncio.sleep(90)   # non ripete lo stesso slot
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[RIEPILOGO ERROR] {e}")
+            await asyncio.sleep(300)
+
+
+async def handle_riepilogo(request: web.Request) -> web.Response:
+    """GET /riepilogo[?notify=1] — il riepilogo a richiesta (stesso testo delle 11 e delle 19)."""
+    try:
+        testo = await costruisci_riepilogo()
+        if str(request.rel_url.query.get("notify", "1")).lower() in ("1", "true", "si", "yes"):
+            await notify_jack(testo, topic="alert")
+        return web.json_response({"ok": True, "testo": testo})
+    except Exception as e:
+        print(f"[RIEPILOGO ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 async def webhook_guardian():
@@ -3163,6 +3297,7 @@ async def main():
         print(f"[WARN] {e}")
     http_runner = await start_http_server()
     asyncio.create_task(webhook_guardian())
+    asyncio.create_task(riepilogo_loop())
     _ripristina_appuntamenti()
     try:
         await client.run_until_disconnected()
