@@ -141,7 +141,7 @@ paused_leads = _carica_paused_leads()
 E1_ALL = os.environ.get("E1_ALL", "false").lower() == "true"
 E1_TEST_IDS = {int(x) for x in os.environ.get("E1_TEST_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
 STATI_REG = ("attesa_link", "link_inviato", "in_registrazione", "registrato", "deposito_dichiarato", "whitelist", "ripensamento")
-TEMPLATE_KEYS = ("link_registrazione", "tutorial_registrazione", "tutorial_mt5", "chiusura", "benvenuto")
+TEMPLATE_KEYS = ("link_registrazione", "tutorial_registrazione", "tutorial_mt5", "chiusura", "benvenuto", "gruppo_pubblico")
 templates_salvati = {}   # key -> telethon Message dai "Messaggi salvati"
 
 
@@ -980,6 +980,15 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                         doc_da_inviare = []
                     if "link_registrazione" in doc_da_inviare and reg_get(sender_id).get("stato") == "whitelist":
                         doc_da_inviare.remove("link_registrazione")   # regola dura: mai il link a chi e' in whitelist
+                    # Il gruppo pubblico e' pubblico: non dipende da whitelist, deposito o registrazione. Se l'agent lo promette
+                    # e il template non c'e', il lead aspetta un link che non arriva (caso King, 21/09): meglio avvisare Jack.
+                    if "gruppo_pubblico" in doc_da_inviare and "gruppo_pubblico" not in templates_salvati:
+                        doc_da_inviare.remove("gruppo_pubblico")
+                        asyncio.create_task(notify_jack(
+                            f"🔗 CHIEDE IL GRUPPO PUBBLICO\n\n👤 {sender_info['full_name']}\n"
+                            f"L'agent gliel'ha promesso ma il template #gruppo_pubblico non e' salvato: mandaglielo tu.\n"
+                            f"(Salva il messaggio col link nei Messaggi salvati con #gruppo_pubblico e non succede piu')\n👉 {link_chat(sender_info, sender_id)}",
+                            topic="alert"))
 
                     # ---- E1: registrato (nessuna pausa, l'agent continua ad accompagnare) ----
                     if re.search(r'\[\s*ALERT[_\s]*REGISTRATO\s*\]', clean_reply, re.I):
