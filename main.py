@@ -788,6 +788,11 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
             _agg["orario_dichiarato"] = ""
         if _r0.get("stato") == "link_inviato" and re.search(r"\b(partito|partita|sto facendo|inizio|comincio|sto registrando|mi registro|sto compilando|apro il conto)\b", combined_text.lower()):
             _agg["stato"] = "in_registrazione"
+        # Registrato che rimanda il deposito ("mi limito a guardare", "aspetto un po'", "non lo so ancora"): da qui i solleciti
+        # cambiano natura (niente "sei riuscito col deposito?", solo l'operativita' che si perde, una volta al giorno).
+        if _r0.get("stato") == "registrato" and _RE_ESITA_DEPOSITO.search(combined_text.lower()) and not _RE_DEPOSITO_FATTO.search(combined_text.lower()):
+            _agg["esita_deposito"] = datetime.now(pytz.UTC).isoformat()
+            print(f"[STATO] {sender_id}: deposito rimandato dal lead")
         if _agg:
             reg_set(sender_id, **_agg)
     media_type = messages[-1].get("media_type", "text")
@@ -1028,7 +1033,7 @@ async def process_messages(sender_id, sender_info, debounce, _rientro_a3: bool =
                     if '[ALERT_DEPOSITO]' in clean_reply:
                         clean_reply = clean_reply.replace('[ALERT_DEPOSITO]', '').strip()
                         if e1_attivo(sender_id):
-                            reg_set(sender_id, stato="deposito_dichiarato"); paused_leads.add(sender_id); _salva_paused_leads()
+                            reg_set(sender_id, stato="deposito_dichiarato", esita_deposito=""); paused_leads.add(sender_id); _salva_paused_leads()
                             if "benvenuto" not in reg_get(sender_id).get("docs", []):
                                 doc_da_inviare.append("benvenuto")   # unico caso in cui l'agent manda il link VIP
                         _scr_ore = _ore_da(reg_get(sender_id).get("deposito_screen_ts") or "")
@@ -2200,6 +2205,36 @@ def testo_fu_attesa_link(n: int, now_it=None) -> str:
         operativita = "Il team ha già operato oggi"
     return t.format(saluto=saluto, operativita=operativita)
 STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
+# Lead registrato che rimanda il deposito: lo capiamo dalle sue parole, senza chiedere nulla al modello
+_RE_ESITA_DEPOSITO = re.compile(
+    r"aspett|mi limito a guardar|caut[oa]\b|ci penso|non lo so ancora|non so ancora|pi[uù]' ?avanti|pi[uù] avanti|vedere prima|prima voglio|prima vorrei|"
+    r"non sono sicur|per adesso no|per il momento|quando avr[oò]|quando mi arriv|stipendio|non ho i soldi|non ho soldi|sono al verde|"
+    r"voglio seguire|seguire meglio|guardare un po|tempo per pensar|lasciami pensar|non ora\b|non adesso", re.I)
+_RE_DEPOSITO_FATTO = re.compile(r"ho depositato|deposito fatto|fatto il deposito|ho versato|ho caricato i soldi|ho messo i soldi|ho ricaricato", re.I)
+# Solleciti FISSI per chi ha rimandato il deposito: un tocco al giorno nelle finestre 9-10 / 18-19, mai "sei riuscito col deposito?".
+# Il messaggio parla di cio' che si perde (l'operativita'), non di cio' che deve fare lui.
+SOGLIE_FU_ESITA = [12, 36, 84]
+FU_DEPOSITO_ESITANTE = [
+    "{saluto} {operativita}. Non vorrei che perdessi l'operatività: quando vuoi entrare basta il deposito e ti attivo subito il VIP 💪",
+    "{saluto} Ti tengo il posto nel VIP ancora per qualche giorno. {operativita_breve}: quando decidi, fai il deposito e in 5 minuti sei operativo 🤝",
+    "Sarebbe un peccato perdere l'opportunità, stiamo facendo un mese di fuoco. Quando vuoi partire io sono qui: deposito e ti attivo subito 🤝",
+]
+
+
+def testo_fu_esitante(n: int, now_it=None) -> str:
+    now_it = now_it or datetime.now(ITALY_TZ)
+    t = FU_DEPOSITO_ESITANTE[max(0, min(n - 1, len(FU_DEPOSITO_ESITANTE) - 1))]
+    saluto = "Buongiorno!" if now_it.hour < 13 else "Ciao!"
+    if now_it.weekday() >= 5:
+        operativita = "Lunedì il team riparte a operare e chi è dentro segue dal primo giorno"
+        operativita_breve = "Lunedì si riparte a operare"
+    elif now_it.hour < 13:
+        operativita = "Il team è già operativo da stamattina e sta andando bene"
+        operativita_breve = "Dentro si opera ogni giorno"
+    else:
+        operativita = "Oggi il team ha già operato e domattina si riparte"
+        operativita_breve = "Domattina si riparte a operare"
+    return t.format(saluto=saluto, operativita=operativita, operativita_breve=operativita_breve)
 FU_RAPIDO_MIN, FU_RAPIDO_MAX = 10 * 60, 15 * 60      # secondi di silenzio prima del sollecito rapido (registrato: sta scegliendo il metodo di deposito)
 FU_RAPIDO_VAGO_MIN, FU_RAPIDO_VAGO_MAX = 45 * 60, 60 * 60   # ha detto un momento vago ("piu' tardi", "tra qualche minuto")
 FU_RAPIDO_REG_MIN, FU_RAPIDO_REG_MAX = 20 * 60, 30 * 60   # link_inviato/in_registrazione: la registrazione dura 10-20 minuti, a 13 minuti "Ci sei?" e' invadente
@@ -2253,6 +2288,21 @@ def parse_orario(testo: str, now=None):
     now = now or datetime.now(ITALY_TZ)
     if t in ("nessuno", "adesso", "ora", "subito"):
         return None
+    # "la settimana prossima", "tra una settimana", "tra 3 giorni", "nel weekend", "il mese prossimo": momenti veri, non vaghi
+    if re.search(r"settimana prossima|prossima settimana", t):
+        d = now.date() + timedelta(days=(7 - now.weekday()) % 7 or 7)
+        return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
+    m = re.search(r"\btra\s+(?:un[']?|una\s+|due\s+|tre\s+)?(\d+)?\s*(giorn|settiman)", t)
+    if m:
+        n = int(m.group(1) or (2 if "due" in m.group(0) else 3 if "tre" in m.group(0) else 1))
+        d = now.date() + timedelta(days=n * (7 if m.group(2).startswith("settiman") else 1))
+        return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
+    if re.search(r"weekend|week end|fine settimana", t) and "dopo" not in t:
+        d = now.date() + timedelta(days=(5 - now.weekday()) % 7 or 7)
+        return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
+    if re.search(r"mese prossimo|prossimo mese|inizio (del )?mese", t):
+        d = (now.date().replace(day=28) + timedelta(days=4)).replace(day=1)
+        return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
     m = re.search(r"\btra\s+(?:un[']?|una\s+)?(\d+)?\s*(minut|min\b|or[ae]\b|mezz)", t)
     if m:
         n = int(m.group(1) or 1)
@@ -2478,6 +2528,8 @@ async def _fu_rapido(chat_id, sender_info: dict):
             return
         if str(chat_id) in lead_state.get("appuntamenti", {}):
             return   # ha detto quando lo fa: lo risentiamo noi all'ora giusta, non prima
+        if stato == "registrato" and r.get("esita_deposito"):
+            return   # ha rimandato il deposito: niente "ci sei?" dopo 15 minuti, ci pensano i solleciti giornalieri
         if pending_messages.get(chat_id) or (time.time() - last_typing.get(chat_id, 0)) < 90:
             return   # sta scrivendo adesso: risponde l'agent
         # Se aveva detto un orario PRECISO c'e' un appuntamento e siamo gia' usciti sopra (controllo appuntamenti).
@@ -2517,11 +2569,13 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
         if stato not in SOGLIE_FU_REG or int(cid) in paused_leads or not e1_attivo(cid):
             continue
         tocchi = int(r.get("tocchi", 0) or 0)
-        soglie = SOGLIE_FU_REG[stato]
+        esitante = stato == "registrato" and bool(r.get("esita_deposito"))
+        soglie = SOGLIE_FU_ESITA if esitante else SOGLIE_FU_REG[stato]
         if tocchi >= len(soglie):
             continue
-        # dal tocco 3 solo nelle finestre 9-10 / 18-19; per attesa_link gia' dal tocco 2 (deve arrivare "la mattina dopo", non alle 3 di notte)
-        if tocchi >= (1 if stato == "attesa_link" else 2) and not finestra_piena:
+        # dal tocco 3 solo nelle finestre 9-10 / 18-19; per attesa_link gia' dal tocco 2 (deve arrivare "la mattina dopo", non alle 3 di notte);
+        # per chi ha rimandato il deposito SEMPRE e solo in finestra: e' un messaggio al giorno, non un "ci sei?" alle 22.
+        if (esitante or tocchi >= (1 if stato == "attesa_link" else 2)) and not finestra_piena:
             report["skip"][cid] = "fuori finestra"; continue
         if pending_messages.get(int(cid)):
             continue   # sta scrivendo adesso
@@ -2553,6 +2607,19 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
                 try:
                     await notify_jack(f"⏳ NON RISPONDE (E1)\n\nChat {cid}: 3 follow-up dopo 'hai 10 minuti?' senza risposta. Il link NON e' partito. "
                                       f"Non lo mando in Perso: decidi tu (scrivigli o lascialo ai follow-up normali).\n👉 tg://user?id={cid}", topic="alert")
+                    report["alert"].append(cid)
+                except Exception:
+                    pass
+            continue
+        if esitante:
+            testo = testo_fu_esitante(tocchi + 1, now_it)
+            await send_split_messages(int(cid), testo)
+            reg_set(cid, tocchi=tocchi + 1)
+            report["inviati"].append({"chat_id": cid, "stato": "registrato (deposito rimandato)", "tocco": tocchi + 1, "testo": testo})
+            if tocchi + 1 >= len(soglie):
+                try:
+                    await notify_jack(f"⏳ NON DEPOSITA (E1)\n\nChat {cid}: registrato, aveva rimandato il deposito, 3 solleciti sull'operativita' senza risposta. "
+                                      f"Non lo mando in Perso: decidi tu.\n👉 tg://user?id={cid}", topic="alert")
                     report["alert"].append(cid)
                 except Exception:
                     pass
@@ -3173,7 +3240,8 @@ async def costruisci_riepilogo() -> str:
             continue
         info, sil = await _info_lead(cid)
         pausa = " ⏸ in pausa" if int(cid) in paused_leads else ""
-        riga = f"• {info['full_name']} — {_STATO_ETICHETTA.get(stato, stato)}{_da_quanto(sil)}{pausa}\n  {link_chat(info, cid)}"
+        etichetta = "registrato, ha rimandato il deposito" if (stato == "registrato" and r.get("esita_deposito")) else _STATO_ETICHETTA.get(stato, stato)
+        riga = f"• {info['full_name']} — {etichetta}{_da_quanto(sil)}{pausa}\n  {link_chat(info, cid)}"
         (righe_reg if stato in _STATI_IN_REG else righe_chiudere).append(riga)
 
     totale = len(righe_app) + len(righe_reg) + len(righe_chiudere)
