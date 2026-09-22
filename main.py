@@ -2301,6 +2301,20 @@ def parse_orario(testo: str, now=None):
     if re.search(r"settimana prossima|prossima settimana", t):
         d = now.date() + timedelta(days=(7 - now.weekday()) % 7 or 7)
         return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
+    # "tra un paio d'ore", "tra qualche minuto", "un paio di giorni": il lead li usa di continuo e non sono vaghi
+    m = re.search(r"\b(?:tra|fra)\s+(?:un\s+paio\s+d[i']\s*|qualche\s+|\d+\s+)?(minut|or[ae]\b|giorn|settiman)", t)
+    if m and re.search(r"un\s+paio|qualche", t):
+        unita = m.group(1)
+        n = 2 if "paio" in t else (15 if unita.startswith("minut") else 2)
+        if unita.startswith("minut"):
+            return now + timedelta(minutes=10 if "paio" in t else 15)
+        if unita.startswith("or"):
+            return now + timedelta(hours=2)
+        if unita.startswith("giorn"):
+            d = now.date() + timedelta(days=n)
+            return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
+        d = now.date() + timedelta(days=7 * n)
+        return ITALY_TZ.localize(datetime(d.year, d.month, d.day, 10, 0))
     m = re.search(r"\btra\s+(?:un[']?|una\s+|due\s+|tre\s+)?(\d+)?\s*(giorn|settiman)", t)
     if m:
         n = int(m.group(1) or (2 if "due" in m.group(0) else 3 if "tre" in m.group(0) else 1))
