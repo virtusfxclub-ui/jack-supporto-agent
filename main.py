@@ -2218,7 +2218,8 @@ STATI_FU_RAPIDO = ("link_inviato", "in_registrazione", "registrato")
 _RE_ESITA_DEPOSITO = re.compile(
     r"aspett|mi limito a guardar|caut[oa]\b|ci penso|non lo so ancora|non so ancora|pi[uù]' ?avanti|pi[uù] avanti|vedere prima|prima voglio|prima vorrei|"
     r"non sono sicur|per adesso no|per il momento|quando avr[oò]|quando mi arriv|stipendio|non ho i soldi|non ho soldi|sono al verde|"
-    r"voglio seguire|seguire meglio|guardare un po|tempo per pensar|lasciami pensar|non ora\b|non adesso", re.I)
+    r"voglio seguire|seguire meglio|guardare un po|tempo per pensar|lasciami pensar|non ora\b|non adesso|"
+    r"disponibilit|ti avver?t[oò] io|ti avviso io|ti faccio sapere io|quando potr[oò]", re.I)
 _RE_DEPOSITO_FATTO = re.compile(r"ho depositato|deposito fatto|fatto il deposito|ho versato|ho caricato i soldi|ho messo i soldi|ho ricaricato", re.I)
 # Solleciti FISSI per chi ha rimandato il deposito: un tocco al giorno nelle finestre 9-10 / 18-19, mai "sei riuscito col deposito?".
 # Il messaggio parla di cio' che si perde (l'operativita'), non di cio' che deve fare lui.
@@ -2608,6 +2609,20 @@ async def followup_registrazione(dry_run: bool = False) -> dict:
             report["skip"][cid] = f"lettura fallita {e}"; continue
         if not msgs or not _is_our_sender(msgs[-1]["sender"]):
             continue   # il lead ha scritto per ultimo: risponde l'agent, non il follow-up
+        if stato == "registrato" and not esitante:
+            # v45: registrati prima della v42 (o flag perso): se DOPO il passo bonus/deposito ha rimandato, lo segniamo ora
+            _dopo, _txt = False, []
+            for _m in msgs:
+                _t = (_m.get("text") or "")
+                if _is_our_sender(_m["sender"]):
+                    if re.search(r"settaggi o premi|codice promozionale|deposita", _t, re.I):
+                        _dopo = True
+                elif _dopo:
+                    _txt.append(_t.lower())
+            _txt = " ".join(_txt)
+            if _txt and _RE_ESITA_DEPOSITO.search(_txt) and not _RE_DEPOSITO_FATTO.search(_txt):
+                reg_set(cid, esita_deposito=datetime.now(pytz.UTC).isoformat(), tocchi=0)
+                report["skip"][cid] = "esita_deposito dallo storico"; continue
         ore = _ore_da(msgs[-1]["timestamp_iso"]) or 0
         soglia = soglie[tocchi]
         if stato == "attesa_link" and r.get("orario_dichiarato"):
