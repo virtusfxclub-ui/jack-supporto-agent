@@ -2187,11 +2187,12 @@ ULTIMI MESSAGGI:
 Rispondi SOLO con il testo del messaggio (o SKIP), senza virgolette."""
 
 # Ore dall'ultimo NOSTRO messaggio per i solleciti orari (tocco 1..4), dopo il sollecito rapido dei 10-15 minuti
-# che parte dal main (programma_fu_rapido). Ritmo di Jack: 10-15 min -> 2h -> 6h -> giorno dopo -> 48h -> a Jack, mai Perso.
+# che parte dal main (programma_fu_rapido). Ritmo (v46, Lorenzo 24/09): stretto all'inizio (10-15 min -> 2h -> 6h), poi pause che si allungano:
+# +1 giorno, +2 giorni, +3 giorni -> a Jack, mai Perso. Le soglie sono ore dall'ULTIMO nostro messaggio (pause, non cumulate).
 # attesa_link (v34): il link NON parte mai senza una risposta del lead. Tre follow-up fissi: 2h (soft), poi la mattina
 # dopo (FOMO: si sta operando, ti tengo il posto), poi dopo altri 2 giorni ("peccato perdere l'opportunita'"), poi alert a Jack.
 SOGLIE_FU_REG = {
-    "attesa_link": [2, 14, 62], "link_inviato": [2, 6, 24, 48], "in_registrazione": [2, 6, 24, 48], "registrato": [2, 8, 24, 48],
+    "attesa_link": [2, 14, 62], "link_inviato": [2, 6, 24, 48, 72], "in_registrazione": [2, 6, 24, 48, 72], "registrato": [2, 8, 24, 48, 72],
 }
 SOGLIA_ATTESA_LINK_CON_ORARIO = 20   # "lo faccio stasera" e poi sparisce: si aspetta 20h, poi partono i follow-up (non il link)
 FU_ATTESA_LINK = [
@@ -2456,7 +2457,38 @@ TESTI_APPUNTAMENTO = {
     "attesa_link": "Eccoci! Hai 10 minuti ora? Ti giro il link e facciamo la registrazione assieme",
     "registrazione": "Eccoci! Riusciamo a farla ora? Se ti blocchi da qualche parte mandami uno screen, ci sono io",
     "deposito": "Ciao! Come detto oggi partiamo: riesci a fare il deposito così ti attivo subito il VIP?",
+    "riprendi": "Eccomi come promesso! Riprendiamo da dove eravamo rimasti?",
 }
+
+PROMPT_APPUNTAMENTO_REG = """Sei Jack di Virtus FX Club. Stai seguendo un lead nella registrazione su AXI. Vi eravate dati appuntamento a ADESSO ("{quando}") e ora gli scrivi tu per primo, come promesso.
+STATO: {stato} (link_inviato / in_registrazione = sta facendo la registrazione; registrato = conto aperto, restano verifica, bonus e deposito)
+
+Scrivi il messaggio con cui riprendi DAL PUNTO ESATTO in cui vi eravate fermati (leggi gli ultimi messaggi):
+- c'era un problema aperto (conto "in attesa di revisione", "servono documenti aggiuntivi", verifica ID, carta rifiutata, bonus che non si attiva): chiedi di quello. Es. "Eccomi! Ti hanno confermato il conto?" / "Ciao! Sei riuscito a fare la verifica ID?"
+- il prossimo passo era il bonus: "Eccomi come promesso! Riusciamo a finire il bonus?"
+- il prossimo passo era il deposito e NON ha detto che lo fa più avanti: "Ciao! Come detto oggi partiamo, riesci a fare il deposito così ti attivo il VIP?"
+- se ha detto che il deposito lo fa più avanti (quando inizia a lavorare, a fine mese, allo stipendio, tra X settimane) NON chiedere il deposito: chiedi solo del passo rimasto aperto.
+Stile: come Jack al telefono, 1 riga, massimo 2, niente punto finale, un'emoji al massimo. Nome solo se il lead lo ha scritto lui in un messaggio. Vietati: link, cifre di guadagno, spiegazioni, "fammi sapere".
+
+ULTIMI MESSAGGI:
+{chat}
+
+Rispondi SOLO con il testo del messaggio, senza virgolette."""
+
+
+async def _genera_testo_appuntamento(cid: int, stato: str, quando: str, msgs: list) -> str:
+    chat_text = "\n".join(f"[{m['time']}] {m['sender']}: {m['text']}" for m in (msgs or [])[-20:])
+    prompt = PROMPT_APPUNTAMENTO_REG.format(quando=quando or "adesso", stato=stato, chat=chat_text)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 120, "messages": [{"role": "user", "content": prompt}]},
+            timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            d = await resp.json(); testo = (d.get("content", [{}])[0].get("text") or "").strip().strip('"')
+    if not testo or testo.upper().startswith("SKIP") or "http" in testo.lower():
+        return ""
+    testo = scarta_meta(ricuci_testo(normalizza_flag(estrai_msg(testo)[0])))
+    return re.sub(r'\[\s*[A-Z0-9_:]+\s*\]', '', testo).strip()[:300]
 
 
 async def _appuntamento(chat_id):
@@ -2475,7 +2507,7 @@ async def _appuntamento(chat_id):
         while is_night_time():
             await asyncio.sleep(300)
         try:
-            _, msgs = await read_chat_messages(int(chat_id), hours=24 * 3, limit=30)
+            _, msgs = await read_chat_messages(int(chat_id), hours=24 * 14, limit=40)
         except Exception as _e:
             msgs = None
             print(f"[APPUNTAMENTO] {chat_id}: chat non leggibile ({_e})")
@@ -2511,10 +2543,14 @@ async def _appuntamento(chat_id):
         else:
             if stato == "attesa_link":
                 testo = TESTI_APPUNTAMENTO["attesa_link"]
-            elif stato in ("link_inviato", "in_registrazione"):
-                testo = TESTI_APPUNTAMENTO["registrazione"]
-            elif stato == "registrato":
-                testo = TESTI_APPUNTAMENTO["deposito"]
+            elif stato in ("link_inviato", "in_registrazione", "registrato"):
+                testo = ""
+                try:
+                    testo = await _genera_testo_appuntamento(int(chat_id), stato, a.get("testo") or "", msgs)
+                except Exception as _e:
+                    print(f"[APPUNTAMENTO] {chat_id}: generazione fallita ({_e}), uso il testo fisso")
+                if not testo:
+                    testo = TESTI_APPUNTAMENTO["registrazione" if stato != "registrato" else "riprendi"]
             else:
                 lead_state["appuntamenti"].pop(str(chat_id), None); _salva_lead_state(); return
             await send_split_messages(int(chat_id), testo)
@@ -2918,10 +2954,10 @@ PROMPT_SCREENSHOT = """Questo screenshot arriva da una persona che si sta regist
 Descrivi in UNA riga, in italiano, cosa mostra, scegliendo SOLO tra questi casi:
 1) "scelta tipo conto" (indica il tipo selezionato: Standard/Pro/altro)
 2) "valuta e leva" (indica valuta e leva selezionate)
-3) "codice promozionale / premi" (indica se e' visibile AXI50 o AXI100)
+3) "codice promozionale / premi" (indica se e' visibile AXI50 o AXI100, e se il conto o i codici risultano grigi / non selezionabili)
 4) "deposito / metodo di pagamento" (indica metodo e cifra se visibili)
 5) "errore carta o pagamento rifiutato" (riporta il testo dell'errore)
-6) "conto creato / dashboard" (indica numero conto o stato 'in attesa di revisione' se visibili)
+6) "conto creato / dashboard" (indica numero conto, server e leva se visibili; riporta TESTUALE ogni scritta di stato come 'in attesa di revisione', 'servono documenti aggiuntivi', 'verifica identita'')
 7) "menu laterale / impostazioni" (elenca le voci visibili)
 8) "mail di chiusura inviata" (screenshot di una mail a success@axi.com)
 9) "altro" (descrivi in poche parole; se e' un sito diverso da AXI dillo)
